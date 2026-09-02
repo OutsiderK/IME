@@ -1,0 +1,176 @@
+package imecore
+
+import (
+	"testing"
+
+	moqipb "github.com/gaboolic/moqi-ime/proto"
+)
+
+func TestParseProtoRequestMapsKeyStatesAndIDs(t *testing.T) {
+	commandID := uint32(3)
+	buttonID := "settings"
+	req := ParseProtoRequest(&moqipb.ClientRequest{
+		Method:    moqipb.Method_METHOD_ON_COMMAND,
+		SeqNum:    1,
+		CommandId: &commandID,
+		ButtonId:  &buttonID,
+		KeyEvent: &moqipb.KeyEvent{
+			KeyStates: []uint32{0, 1, 0, 2},
+		},
+	})
+
+	want := []int{0, 1, 0, 2}
+	if len(req.KeyStates) != len(want) {
+		t.Fatalf("expected %d key states, got %d", len(want), len(req.KeyStates))
+	}
+	for i, expected := range want {
+		if req.KeyStates[i] != expected {
+			t.Fatalf("expected keyStates[%d]=%d, got %d", i, expected, req.KeyStates[i])
+		}
+	}
+	if got := req.ID.IntValue(); got != 3 {
+		t.Fatalf("expected numeric id 3, got %d", got)
+	}
+	if got, _ := req.Data["buttonId"].(string); got != "settings" {
+		t.Fatalf("expected buttonId settings, got %#v", req.Data["buttonId"])
+	}
+}
+
+func TestParseProtoRequestAcceptsGuidStringID(t *testing.T) {
+	guid := "{guid}"
+	req := ParseProtoRequest(&moqipb.ClientRequest{
+		Method: moqipb.Method_METHOD_INIT,
+		SeqNum: 1,
+		Guid:   &guid,
+	})
+
+	if got := req.ID.StringValue(); got != "{guid}" {
+		t.Fatalf("expected string id {guid}, got %q", got)
+	}
+}
+
+func TestParseProtoRequestMapsCandidateInteractionFields(t *testing.T) {
+	index := int32(4)
+	backward := true
+	req := ParseProtoRequest(&moqipb.ClientRequest{
+		Method:         moqipb.Method_METHOD_HIGHLIGHT_CANDIDATE,
+		SeqNum:         2,
+		CandidateIndex: &index,
+		PageBackward:   &backward,
+	})
+
+	if req.Method != "highlightCandidate" {
+		t.Fatalf("expected highlightCandidate method, got %q", req.Method)
+	}
+	if !req.HasCandidateIndex || req.CandidateIndex != 4 {
+		t.Fatalf("expected candidate index 4 present, got %+v", req)
+	}
+	if !req.PageBackward {
+		t.Fatalf("expected pageBackward=true, got false")
+	}
+}
+
+func TestBuildProtoResponseIncludesClearedCompositionState(t *testing.T) {
+	resp := NewResponse(1, true)
+	resp.ReturnValue = 1
+
+	msg, err := BuildProtoResponse("client-1", resp)
+	if err != nil {
+		t.Fatalf("BuildProtoResponse failed: %v", err)
+	}
+
+	if msg.GetCompositionString() != "" {
+		t.Fatalf("expected empty compositionString, got %q", msg.GetCompositionString())
+	}
+	if msg.GetShowCandidates() {
+		t.Fatalf("expected showCandidates=false, got true")
+	}
+	if len(msg.GetCandidateList()) != 0 {
+		t.Fatalf("expected empty candidateList, got %#v", msg.GetCandidateList())
+	}
+}
+
+func TestBuildProtoResponseIncludesCustomizeUIBooleans(t *testing.T) {
+	resp := NewResponse(1, true)
+	resp.CustomizeUI = map[string]interface{}{
+		"autoPairQuotes":            true,
+		"semicolonSelectSecond":     true,
+		"candCommentFontName":       "Consolas",
+		"candSpacing":               30,
+		"candCommentColor":          "#112233",
+		"candCommentHighlightColor": "#445566",
+		"autoPairRules": []AutoPairRule{
+			{Open: "“", Close: "”"},
+			{Open: "(", Close: ")"},
+		},
+	}
+
+	msg, err := BuildProtoResponse("client-1", resp)
+	if err != nil {
+		t.Fatalf("BuildProtoResponse failed: %v", err)
+	}
+
+	if msg.GetCustomizeUi() == nil {
+		t.Fatal("expected customize_ui to be present")
+	}
+	if got := msg.GetCustomizeUi().GetAutoPairQuotes(); !got {
+		t.Fatalf("expected autoPairQuotes=true, got %v", got)
+	}
+	if got := msg.GetCustomizeUi().GetSemicolonSelectSecond(); !got {
+		t.Fatalf("expected semicolonSelectSecond=true, got %v", got)
+	}
+	if got := msg.GetCustomizeUi().GetCandCommentFontName(); got != "Consolas" {
+		t.Fatalf("expected candCommentFontName=Consolas, got %q", got)
+	}
+	if got := msg.GetCustomizeUi().GetCandSpacing(); got != 30 {
+		t.Fatalf("expected candSpacing=30, got %d", got)
+	}
+	if got := msg.GetCustomizeUi().GetCandCommentColor(); got != "#112233" {
+		t.Fatalf("expected candCommentColor=#112233, got %q", got)
+	}
+	if got := msg.GetCustomizeUi().GetCandCommentHighlightColor(); got != "#445566" {
+		t.Fatalf("expected candCommentHighlightColor=#445566, got %q", got)
+	}
+	rules := msg.GetCustomizeUi().GetAutoPairRules()
+	if len(rules) != 2 {
+		t.Fatalf("expected 2 autoPairRules, got %#v", rules)
+	}
+	if rules[0].GetOpen() != "“" || rules[0].GetClose() != "”" {
+		t.Fatalf("unexpected first autoPairRule: %#v", rules[0])
+	}
+	if rules[1].GetOpen() != "(" || rules[1].GetClose() != ")" {
+		t.Fatalf("unexpected second autoPairRule: %#v", rules[1])
+	}
+}
+
+func TestBuildProtoResponseOmitsUnsetCandidateCursor(t *testing.T) {
+	resp := NewResponse(3, true)
+	resp.ShowCandidates = true
+	resp.CandidateList = []string{"你"}
+
+	msg, err := BuildProtoResponse("client-1", resp)
+	if err != nil {
+		t.Fatalf("BuildProtoResponse failed: %v", err)
+	}
+
+	if msg.CandidateCursor != nil {
+		t.Fatalf("expected candidateCursor to be omitted, got %#v", msg.CandidateCursor)
+	}
+}
+
+func TestBuildProtoResponseIncludesCandidateCursorWhenPresent(t *testing.T) {
+	resp := NewResponse(4, true)
+	resp.ShowCandidates = true
+	resp.CandidateList = []string{"你"}
+	resp.CandidateCursor = 2
+	resp.HasCandidateCursor = true
+
+	msg, err := BuildProtoResponse("client-1", resp)
+	if err != nil {
+		t.Fatalf("BuildProtoResponse failed: %v", err)
+	}
+
+	if msg.CandidateCursor == nil || msg.GetCandidateCursor() != 2 {
+		t.Fatalf("expected candidateCursor=2, got %#v", msg.CandidateCursor)
+	}
+}

@@ -1,0 +1,16 @@
+{
+  "api": {
+    "base_url": "http://127.0.0.1:8080/v1",
+    "api_key": "ime-local",
+    "model": "qwen3.5-4b-ime"
+  },
+  "actions": [],
+  "completion": {
+    "enabled": true,
+    "idle_ms": 450,
+    "context_tokens": 320,
+    "max_output_tokens": 64,
+    "candidate_count": 3,
+    "temperature": 0.3
+  }
+}

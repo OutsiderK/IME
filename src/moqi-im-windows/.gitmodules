@@ -1,0 +1,12 @@
+[submodule "libuv"]
+	path = libuv
+	url = https://github.com/EasyIME/libuv
+[submodule "libIME2"]
+	path = libIME2
+	url = https://github.com/gaboolic/libIME2.git
+[submodule "jsoncpp"]
+	path = jsoncpp
+	url = https://github.com/open-source-parsers/jsoncpp.git
+[submodule "installer/Inno-Setup-Chinese-Simplified-Translation"]
+	path = installer/Inno-Setup-Chinese-Simplified-Translation
+	url = https://github.com/kira-96/Inno-Setup-Chinese-Simplified-Translation

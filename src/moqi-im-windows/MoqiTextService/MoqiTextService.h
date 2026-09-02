@@ -1,0 +1,395 @@
+//
+//	Copyright (C) 2013 Hong Jen Yee (PCMan) <pcman.tw@gmail.com>
+//
+//	This library is free software; you can redistribute it and/or
+//	modify it under the terms of the GNU Library General Public
+//	License as published by the Free Software Foundation; either
+//	version 2 of the License, or (at your option) any later version.
+//
+//	This library is distributed in the hope that it will be useful,
+//	but WITHOUT ANY WARRANTY; without even the implied warranty of
+//	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+//	Library General Public License for more details.
+//
+//	You should have received a copy of the GNU Library General Public
+//	License along with this library; if not, write to the
+//	Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
+//	Boston, MA  02110-1301, USA.
+//
+
+#ifndef NODE_TEXT_SERVICE_H
+#define NODE_TEXT_SERVICE_H
+
+#include <LibIME2/src/TextService.h>
+#include <LibIME2/src/MessageWindow.h>
+#include <LibIME2/src/EditSession.h>
+#include <LibIME2/src/LangBarButton.h>
+#include "MoqiImeModule.h"
+#include "MoqiCandidateWindow.h"
+#include <sys/types.h>
+#include "MoqiClient.h"
+#include <algorithm>
+#include <memory>
+
+
+namespace Moqi {
+
+class TextService: public Ime::TextService {
+	friend class Client;
+public:
+	TextService(ImeModule* module);
+
+	virtual void onActivate();
+	virtual void onDeactivate();
+
+	virtual void onFocus();
+	virtual void onSetFocus() override;
+	virtual void onKillFocus() override;
+	virtual void onSetThreadFocus() override;
+	virtual void onKillThreadFocus() override;
+
+	virtual bool filterKeyDown(Ime::KeyEvent& keyEvent);
+	virtual bool onKeyDown(Ime::KeyEvent& keyEvent, Ime::EditSession* session);
+
+	virtual bool filterKeyUp(Ime::KeyEvent& keyEvent);
+	virtual bool onKeyUp(Ime::KeyEvent& keyEvent, Ime::EditSession* session);
+
+	virtual bool onPreservedKey(const GUID& guid);
+	STDMETHODIMP OnPreservedKey(ITfContext* pContext, REFGUID rguid, BOOL* pfEaten) override;
+
+	virtual bool onCommand(UINT id, CommandType type);
+
+	// called when a language bar button needs a menu
+	virtual bool onMenu(LangBarButton* btn, ITfMenu* pMenu);
+
+	// called when a language bar button needs a menu
+	virtual HMENU onMenu(LangBarButton* btn);
+
+	// called when a compartment value is changed
+	virtual void onCompartmentChanged(const GUID& key);
+
+	// called when the keyboard is opened or closed
+	virtual void onKeyboardStatusChanged(bool opened);
+
+	// called just before current composition is terminated for doing cleanup.
+	// if forced is true, the composition is terminated by others, such as
+	// the input focus is grabbed by another application.
+	// if forced is false, the composition is terminated gracefully by endComposition().
+	virtual void onCompositionTerminated(bool forced);
+
+	virtual void onLangProfileActivated(REFIID lang);
+
+	virtual void onLangProfileDeactivated(REFIID lang);
+
+	virtual void onLayoutChange(ITfContext* context, TfLayoutCode code, ITfContextView* view) override;
+
+	// methods called by Moqi::Client
+	int candPerRow() const {
+		return candPerRow_;
+	}
+
+	void setCandPerRow(int candPerRow) {
+		candPerRow_ = candPerRow;
+	}
+
+	int candSpacing() const {
+		return candSpacing_;
+	}
+
+	void setCandSpacing(int candSpacing) {
+		candSpacing_ = candSpacing;
+	}
+
+	std::wstring selKeys() const {
+		return selKeys_;
+	}
+
+	void setSelKeys(std::wstring selKeys) {
+		selKeys_ = selKeys;
+	}
+
+	bool candUseCursor() const {
+		return candUseCursor_;
+	}
+
+	void setCandUseCursor(bool candUseCursor) {
+		candUseCursor_ = candUseCursor;
+	}
+
+	std::wstring candFontName() const {
+		return candFontName_;
+	}
+
+	void setCandFontName(std::wstring candFontName) {
+		candFontName_ = candFontName;
+		updateFont_ = true;
+		applyCandidateAppearanceNow();
+	}
+
+	std::wstring candCommentFontName() const {
+		return candCommentFontName_;
+	}
+
+	void setCandCommentFontName(std::wstring candCommentFontName) {
+		candCommentFontName_ = candCommentFontName;
+		updateFont_ = true;
+		applyCandidateAppearanceNow();
+	}
+
+	int candFontSize() {
+		return candFontSize_;
+	}
+
+	void setCandFontSize(int candFontSize) {
+		candFontSize_ = candFontSize;
+		updateFont_ = true;
+		applyCandidateAppearanceNow();
+	}
+
+	int candCommentFontSize() const {
+		return candCommentFontSize_;
+	}
+
+	void setCandCommentFontSize(int candCommentFontSize) {
+		candCommentFontSize_ = candCommentFontSize;
+		updateFont_ = true;
+		applyCandidateAppearanceNow();
+	}
+
+	COLORREF candBackgroundColor() const {
+		return candBackgroundColor_;
+	}
+
+	void setCandBackgroundColor(COLORREF color) {
+		candBackgroundColor_ = color;
+	}
+
+	COLORREF candHighlightColor() const {
+		return candHighlightColor_;
+	}
+
+	void setCandHighlightColor(COLORREF color) {
+		candHighlightColor_ = color;
+	}
+
+	COLORREF candTextColor() const {
+		return candTextColor_;
+	}
+
+	void setCandTextColor(COLORREF color) {
+		candTextColor_ = color;
+	}
+
+	COLORREF candHighlightTextColor() const {
+		return candHighlightTextColor_;
+	}
+
+	void setCandHighlightTextColor(COLORREF color) {
+		candHighlightTextColor_ = color;
+	}
+
+	COLORREF candCommentColor() const {
+		return candCommentColor_;
+	}
+
+	void setCandCommentColor(COLORREF color) {
+		candCommentColor_ = color;
+	}
+
+	COLORREF candCommentHighlightColor() const {
+		return candCommentHighlightColor_;
+	}
+
+	void setCandCommentHighlightColor(COLORREF color) {
+		candCommentHighlightColor_ = color;
+	}
+
+	bool inlinePreedit() const {
+		return inlinePreedit_;
+	}
+
+	bool effectiveUiLess() const {
+		return isUiLess() || autoUiLessOverride_ || manualUiLessOverride_;
+	}
+
+	bool effectiveInlinePreedit() const {
+		if (autoInlinePreeditDisabled_) {
+			return false;
+		}
+		return effectiveUiLess() || inlinePreedit_;
+	}
+
+	bool effectiveExternalPreedit() const {
+		return !effectiveInlinePreedit();
+	}
+
+	bool tsfCandidateUiEnabled() const {
+		return !autoDisableTsfCandidateUi_;
+	}
+
+	virtual bool inlinePreeditEnabledForComposition() const override {
+		return effectiveInlinePreedit();
+	}
+
+	virtual bool shouldUseDummyCompositionAnchor() const override {
+		return !effectiveUiLess() && autoDummyAnchorCompat_;
+	}
+
+	void setInlinePreedit(bool inlinePreedit) {
+		inlinePreedit_ = inlinePreedit;
+		if (candidateWindow_) {
+			candidateWindow_->setPreeditText(effectiveInlinePreedit() ? L"" : candidatePreedit_);
+			candidateWindow_->setPreeditCursor(effectiveInlinePreedit() ? 0 : candidatePreeditCursor_);
+			invalidateCandidateUiCache();
+		}
+	}
+
+	bool autoPairQuotes() const {
+		return autoPairQuotes_;
+	}
+
+	void setAutoPairQuotes(bool autoPairQuotes) {
+		autoPairQuotes_ = autoPairQuotes;
+	}
+
+	void suppressNextCompositionTerminatedNotification() {
+		suppressNextCompositionTerminatedNotification_ = true;
+	}
+
+	const std::wstring& candidatePreedit() const {
+		return candidatePreedit_;
+	}
+
+	void setCandidatePreedit(std::wstring preedit) {
+		if (candidatePreedit_ == preedit) {
+			return;
+		}
+		candidatePreedit_ = preedit;
+		if (candidatePreeditCursor_ > static_cast<int>(candidatePreedit_.length())) {
+			candidatePreeditCursor_ = static_cast<int>(candidatePreedit_.length());
+		}
+		if (candidateWindow_) {
+			candidateWindow_->setPreeditText(effectiveInlinePreedit() ? L"" : candidatePreedit_);
+			candidateWindow_->setPreeditCursor(effectiveInlinePreedit() ? 0 : candidatePreeditCursor_);
+		}
+	}
+
+	void setCandidatePreeditCursor(int cursor) {
+		cursor = (std::max)(0, (std::min)(cursor, static_cast<int>(candidatePreedit_.length())));
+		if (candidatePreeditCursor_ == cursor) {
+			return;
+		}
+		candidatePreeditCursor_ = cursor;
+		if (candidateWindow_) {
+			candidateWindow_->setPreeditCursor(effectiveInlinePreedit() ? 0 : candidatePreeditCursor_);
+		}
+	}
+
+	bool showingCandidates() {
+		return showingCandidates_;
+	}
+
+	bool pendingCandidateRecovery() const {
+		return pendingCandidateRecovery_;
+	}
+
+	// candidate window
+	void showCandidates(Ime::EditSession* session);
+	void updateCandidates(Ime::EditSession* session);
+    void updateCandidatesWindow(Ime::EditSession* session);
+	void hideCandidates(bool preserveRecoveryState = false);
+	bool highlightCandidate(int index);
+	bool selectCandidate(int index);
+	bool changeCandidatePage(bool backward);
+
+	void refreshCandidates();
+	bool setCandidateCursor(int cursor);
+	bool hasCandidateWindow() const {
+		return candidateWindow_ != nullptr;
+	}
+
+	// message window
+	void showMessage(Ime::EditSession* session, std::wstring message, int duration = 3);
+    void updateMessageWindow(Ime::EditSession* session);
+	void hideMessage();
+
+private:
+	virtual ~TextService(void);  // COM object should only be deleted using Release()
+
+	void onMessageTimeout();
+	static void CALLBACK onMessageTimeout(HWND hwnd, UINT msg, UINT_PTR id, DWORD time);
+
+	void updateLangButtons(); // update status of language bar buttons
+
+	void createCandidateWindow(Ime::EditSession* session);
+	void destroyCandidateWindow();
+	bool ensureCandidateWindowValid(const wchar_t* reason);
+	int candFontHeight();
+	int candCommentFontHeight();
+	void applyCandidateAppearanceNow();
+	void refreshCandidateAppearance();
+	void applyUiLessOverrideState();
+	void invalidateCandidateUiCache();
+	bool isCandidateContentApplied(const std::wstring& renderedPreedit) const;
+	void markCandidateContentApplied(const std::wstring& renderedPreedit);
+	bool moveCandidateWindowToInputRect(Ime::EditSession* session, const wchar_t* reason, bool throttleSamePosition);
+
+	bool ensureClientForCurrentProfile(const wchar_t* reason);
+	void closeClient();
+
+private:
+	bool validCandidateListElementId_;
+	DWORD candidateListElementId_;
+	bool shouldShowCandidateWindowUI_;
+	bool manualUiLessOverride_;
+	bool autoUiLessOverride_;
+	bool autoDummyAnchorCompat_;
+	bool autoInlinePreeditDisabled_;
+	bool autoDisableTsfCandidateUi_;
+	Ime::ComPtr<Moqi::CandidateWindow> candidateWindow_; // this is a ref-counted COM object and should not be managed with std::unique_ptr
+	bool showingCandidates_;
+	bool pendingCandidateRecovery_;
+	std::vector<CandidateUiItem> candidates_; // current candidate list
+	std::vector<CandidateUiItem> appliedCandidates_;
+	std::wstring appliedSelKeys_;
+	std::wstring appliedCandidatePreedit_;
+	bool hasAppliedCandidateContent_;
+	bool hasAppliedCandidateCursor_;
+	int appliedCandidateCursor_;
+	bool hasLastCandidateWindowPos_;
+	POINT lastCandidateWindowPos_;
+	ULONGLONG lastCandidateWindowMoveTick_;
+	std::unique_ptr<Ime::MessageWindow> messageWindow_;
+	UINT messageTimerId_;
+	HFONT font_;
+	HFONT commentFont_;
+	bool updateFont_;
+	int candPerRow_;
+	int candSpacing_;
+	std::wstring selKeys_;
+	bool candUseCursor_;
+	std::wstring candFontName_;
+	std::wstring candCommentFontName_;
+	int candFontSize_;
+	int candCommentFontSize_;
+	COLORREF candBackgroundColor_;
+	COLORREF candHighlightColor_;
+	COLORREF candTextColor_;
+	COLORREF candHighlightTextColor_;
+	COLORREF candCommentColor_;
+	COLORREF candCommentHighlightColor_;
+	bool inlinePreedit_;
+	bool autoPairQuotes_;
+	bool suppressNextCompositionTerminatedNotification_;
+	std::wstring candidatePreedit_;
+	int candidatePreeditCursor_;
+
+	HMENU popupMenu_;
+
+	std::unique_ptr<Client> client_; // connection client
+	GUID currentLangProfile_;
+};
+
+}
+
+#endif

@@ -1,0 +1,1084 @@
+package rime
+
+import (
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/gaboolic/moqi-ime/imecore"
+)
+
+const (
+	ghostMessageDuration      = -1
+	ghostActionKeyCode        = vkF8
+	ghostNextKeyCode          = vkF9
+	ghostShortMaxRunes        = 16
+	ghostLongMaxRunes         = 56
+	ghostContextMaxSentences  = 6
+	ghostPreservedKeyGUID     = "{7b5cfb72-41d8-4c76-a819-65b698f91a34}"
+	ghostLongPreservedKeyGUID = "{018e48c0-a24f-4b72-bacc-57a2d53284b9}"
+	ghostNextPreservedKeyGUID = "{316649a5-9c0b-4708-a43d-7bedc5bde9bb}"
+	ghostContextEnvelope      = "\x1eMOQI_CONTEXT_V1\x1f"
+	tsfModifierShift          = 0x0004
+)
+
+func ghostPreservedKeyInfos() []imecore.PreservedKeyInfo {
+	return []imecore.PreservedKeyInfo{
+		{KeyCode: uint32(ghostActionKeyCode), GUID: ghostPreservedKeyGUID},
+		{KeyCode: uint32(ghostActionKeyCode), Modifiers: tsfModifierShift, GUID: ghostLongPreservedKeyGUID},
+		{KeyCode: uint32(ghostNextKeyCode), GUID: ghostNextPreservedKeyGUID},
+	}
+}
+
+func (ime *IME) ghostCompletionEnabled() bool {
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	return ime.ghostEnabled
+}
+
+func (ime *IME) configureGhostCompletion(cfg *aiRuntimeConfig) {
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	ime.resetGhostCompletionLocked()
+	ime.ghostEnabled = false
+	ime.ghostGenerator = nil
+	if cfg == nil || !cfg.Completion.Enabled {
+		return
+	}
+	client := newAIClient(cfg)
+	if client == nil {
+		return
+	}
+	ime.ghostConfig = cfg.Completion
+	ime.ghostGenerator = client.GenerateInlineCompletions
+	ime.ghostEnabled = true
+	debugLogf("Ghost completion configured idle_ms=%d context_tokens=%d candidates=%d", ime.ghostConfig.IdleMS, ime.ghostConfig.ContextTokens, ime.ghostConfig.CandidateCount)
+}
+
+func (ime *IME) handleGhostKeyDownFilter(req *imecore.Request, resp *imecore.Response) bool {
+	if req == nil || resp == nil {
+		return false
+	}
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	if !ime.ghostEnabled {
+		return false
+	}
+	if req.KeyCode == vkEscape && ime.hasGhostWorkLocked() {
+		ime.resetGhostCompletionLocked()
+		// Some TSF hosts act on Escape immediately after filterKeyDown. Keep the
+		// complete keystroke inside the IME so the ghost window reliably closes.
+		ime.ghostConsumeKeyUpCode = vkEscape
+		ime.ghostHidePending = true
+		resp.HideMessage = true
+		resp.ReturnValue = 1
+		return true
+	}
+	if req.KeyCode == ghostActionKeyCode && ime.hasGhostWorkLocked() {
+		ime.ghostConsumeKeyUpCode = ghostActionKeyCode
+		resp.ReturnValue = 1
+		return true
+	}
+	if req.KeyCode == ghostNextKeyCode && ime.ghostVisible && ime.ghostReady {
+		ime.ghostConsumeKeyUpCode = ghostNextKeyCode
+		resp.ReturnValue = 1
+		return true
+	}
+	if ime.ghostVisible && isLeftAlt(req) {
+		ime.ghostConsumeKeyUpCode = vkMenu
+		resp.ReturnValue = 1
+		return true
+	}
+	if shouldInvalidateGhostForKey(req) && ime.hasGhostWorkLocked() {
+		wasVisible := ime.ghostVisible
+		ime.resetGhostCompletionLocked()
+		if wasVisible {
+			ime.ghostHidePending = true
+			resp.HideMessage = true
+		}
+	}
+	return false
+}
+
+func (ime *IME) handleGhostKeyUpFilter(req *imecore.Request, resp *imecore.Response) bool {
+	if req == nil || resp == nil {
+		return false
+	}
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	if ime.ghostConsumeKeyUpCode == 0 {
+		return false
+	}
+	if req.KeyCode != ime.ghostConsumeKeyUpCode {
+		return false
+	}
+	resp.ReturnValue = 1
+	return true
+}
+
+func (ime *IME) handleGhostKeyDown(req *imecore.Request, resp *imecore.Response) bool {
+	if req == nil || resp == nil {
+		return false
+	}
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	if !ime.ghostEnabled {
+		return false
+	}
+	if req.KeyCode == vkEscape && ime.ghostHidePending {
+		resp.HideMessage = true
+		resp.ReturnValue = 1
+		ime.ghostHidePending = false
+		return true
+	}
+	if req.KeyCode == ghostActionKeyCode && ime.hasGhostWorkLocked() {
+		return ime.performGhostActionLocked(resp)
+	}
+	if req.KeyCode == ghostNextKeyCode && ime.ghostVisible && ime.ghostReady {
+		if len(ime.ghostCandidates) > 1 {
+			ime.ghostCandidateIndex = (ime.ghostCandidateIndex + 1) % len(ime.ghostCandidates)
+		}
+		ime.fillGhostResponseLocked(resp)
+		resp.ReturnValue = 1
+		return true
+	}
+	if ime.ghostVisible && isLeftAlt(req) {
+		if len(ime.ghostCandidates) > 1 {
+			ime.ghostCandidateIndex = (ime.ghostCandidateIndex + 1) % len(ime.ghostCandidates)
+		}
+		ime.fillGhostResponseLocked(resp)
+		resp.ReturnValue = 1
+		return true
+	}
+	return false
+}
+
+// handleGhostPreservedKey handles F8 through TSF's preserved-key path. Some
+// hosts (notably rich-text editors) reserve F8 themselves and never deliver it
+// through the ordinary key sink, so the regular filterKeyDown path cannot make
+// the shortcut reliable there.
+func (ime *IME) handleGhostPreservedKey(req *imecore.Request, resp *imecore.Response) bool {
+	if req == nil || resp == nil || req.Data == nil {
+		return false
+	}
+	guid, _ := req.Data["guid"].(string)
+	isShort := strings.EqualFold(guid, ghostPreservedKeyGUID)
+	isLong := strings.EqualFold(guid, ghostLongPreservedKeyGUID)
+	isNext := strings.EqualFold(guid, ghostNextPreservedKeyGUID)
+	if !isShort && !isLong && !isNext {
+		return false
+	}
+	if isNext {
+		ime.ghostMu.Lock()
+		defer ime.ghostMu.Unlock()
+		if !ime.ghostEnabled || !ime.ghostVisible || !ime.ghostReady || len(ime.ghostCandidates) < 2 {
+			resp.ReturnValue = 0
+			return true
+		}
+		ime.ghostCandidateIndex = (ime.ghostCandidateIndex + 1) % len(ime.ghostCandidates)
+		ime.fillGhostResponseLocked(resp)
+		resp.ReturnValue = 1
+		return true
+	}
+	longMode := isLong
+	before, following := decodeGhostSurroundingText(req.CloudClipboardText)
+	normalizedBefore := normalizeCompletionContext(before, ime.ghostConfig.ContextTokens)
+	normalizedFollowing := normalizeFollowingCompletionContext(following, 64)
+
+	ime.ghostMu.Lock()
+	if !ime.ghostEnabled {
+		ime.ghostMu.Unlock()
+		resp.ReturnValue = 0
+		return true
+	}
+	surroundingMatches := normalizedBefore != "" && normalizedBefore == ime.ghostContext && normalizedFollowing == ime.ghostFollowingContext
+	// F8 accepts the visible candidate regardless of whether F8 or Shift+F8
+	// generated it. Shift only controls the requested completion length.
+	if ime.ghostVisible && ime.ghostReady && surroundingMatches {
+		accepted := ime.currentGhostCandidateLocked()
+		acceptedContext := ime.ghostContext + accepted
+		acceptedFollowing := ime.ghostFollowingContext
+		acceptedLong := ime.ghostLong
+		ime.performGhostActionLocked(resp)
+		ime.ghostMu.Unlock()
+		if accepted != "" {
+			ime.scheduleGhostCompletionForSurrounding(acceptedContext, acceptedFollowing, false,
+				time.Duration(ime.ghostConfig.IdleMS)*time.Millisecond, acceptedLong)
+		}
+		return true
+	}
+	modeMatches := surroundingMatches && longMode == ime.ghostLong
+	if !ime.hasGhostWorkLocked() || (normalizedBefore != "" && !modeMatches) {
+		hadVisible := ime.ghostVisible
+		ime.ghostMu.Unlock()
+		if normalizedBefore == "" {
+			resp.ReturnValue = 0
+			return true
+		}
+		// F8 is also an on-demand trigger. This makes completion available after
+		// mouse caret moves and in text that was not entered through Moqi.
+		ime.scheduleGhostCompletionForSurrounding(before, following, true, 0, longMode)
+		if hadVisible {
+			resp.HideMessage = true
+		}
+		resp.ReturnValue = 1
+		return true
+	}
+	debugLogf("Ghost completion F8 preserved key received ready=%t visible=%t pending=%t", ime.ghostReady, ime.ghostVisible, ime.ghostPending)
+	accepted := ""
+	acceptedContext := ""
+	acceptedFollowing := ""
+	acceptedLong := ime.ghostLong
+	if ime.ghostVisible && ime.ghostReady {
+		accepted = ime.currentGhostCandidateLocked()
+		acceptedContext = ime.ghostContext + accepted
+		acceptedFollowing = ime.ghostFollowingContext
+	}
+	ime.performGhostActionLocked(resp)
+	ime.ghostMu.Unlock()
+	if accepted != "" {
+		// Prime another completion after accepting one, so repeated F8 can keep
+		// extending the sentence without requiring an intervening keystroke.
+		ime.scheduleGhostCompletionForSurrounding(acceptedContext, acceptedFollowing, false,
+			time.Duration(ime.ghostConfig.IdleMS)*time.Millisecond, acceptedLong)
+	}
+	return true
+}
+
+func (ime *IME) performGhostActionLocked(resp *imecore.Response) bool {
+	if resp == nil || !ime.ghostEnabled || !ime.hasGhostWorkLocked() {
+		return false
+	}
+	if ime.ghostHidePending {
+		resp.HideMessage = true
+		ime.ghostHidePending = false
+	}
+	if ime.ghostVisible && ime.ghostReady {
+		resp.CommitString = ime.currentGhostCandidateLocked()
+		resp.HideMessage = true
+		ime.resetGhostCompletionLocked()
+		resp.ReturnValue = 1
+		return true
+	}
+	if ime.ghostReady {
+		ime.ghostVisible = true
+		ime.fillGhostResponseLocked(resp)
+	} else {
+		ime.ghostRevealRequested = true
+	}
+	resp.ReturnValue = 1
+	return true
+}
+
+func (ime *IME) handleGhostKeyUp(req *imecore.Request, resp *imecore.Response) bool {
+	if req == nil || resp == nil {
+		return false
+	}
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	if ime.ghostConsumeKeyUpCode == 0 {
+		return false
+	}
+	if req.KeyCode != ime.ghostConsumeKeyUpCode {
+		return false
+	}
+	ime.ghostConsumeKeyUpCode = 0
+	if ime.ghostVisible {
+		ime.fillGhostResponseLocked(resp)
+	}
+	resp.ReturnValue = 1
+	return true
+}
+
+func (ime *IME) scheduleGhostCompletion(req *imecore.Request) {
+	if req == nil {
+		return
+	}
+	before, following := decodeGhostSurroundingText(req.CloudClipboardText)
+	ime.scheduleGhostCompletionWithContext(req, before, following)
+}
+
+func (ime *IME) scheduleGhostCompletionAfterCommit(req *imecore.Request, resp *imecore.Response, compositionBeforeCommit string) {
+	if req == nil || resp == nil || strings.TrimSpace(resp.CommitString) == "" {
+		return
+	}
+	documentBefore, following := decodeGhostSurroundingText(req.CloudClipboardText)
+	context := committedGhostContext(documentBefore, compositionBeforeCommit, resp.CommitString)
+	debugLogf("Ghost commit trigger context_runes=%d preedit_runes=%d commit_runes=%d", len([]rune(context)), len([]rune(compositionBeforeCommit)), len([]rune(resp.CommitString)))
+	ime.scheduleGhostCompletionWithContext(req, context, following)
+}
+
+func (ime *IME) scheduleGhostCompletionWithContext(req *imecore.Request, rawContext, rawFollowing string) {
+	if req == nil || !isGhostContextKey(req) {
+		return
+	}
+	ime.scheduleGhostCompletionForSurrounding(rawContext, rawFollowing, false,
+		time.Duration(ime.ghostConfig.IdleMS)*time.Millisecond, false)
+}
+
+func (ime *IME) scheduleGhostCompletionForSurrounding(rawContext, rawFollowing string, revealRequested bool, delay time.Duration, longMode bool) {
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	if !ime.ghostEnabled || ime.ghostGenerator == nil {
+		return
+	}
+	context := normalizeCompletionContext(rawContext, ime.ghostConfig.ContextTokens)
+	following := normalizeFollowingCompletionContext(rawFollowing, 64)
+	if context == "" {
+		return
+	}
+	if hasUnsafeInlineBoundary(context, following) {
+		ime.resetGhostCompletionLocked()
+		return
+	}
+	if context == ime.ghostContext && following == ime.ghostFollowingContext && longMode == ime.ghostLong && ime.hasGhostWorkLocked() {
+		if revealRequested {
+			ime.ghostRevealRequested = true
+		}
+		return
+	}
+	if ime.backend == nil || !ime.backendReady() || ime.backend.State().Composition != "" {
+		ime.resetGhostCompletionLocked()
+		return
+	}
+
+	ime.resetGhostCompletionLocked()
+	ime.ghostContext = context
+	ime.ghostFollowingContext = following
+	ime.ghostLong = longMode
+	ime.ghostRevealRequested = revealRequested
+	ime.ghostRequestSeq++
+	requestSeq := ime.ghostRequestSeq
+	ime.ghostTimer = time.AfterFunc(delay, func() {
+		ime.startGhostCompletion(requestSeq, context, following, longMode)
+	})
+	debugLogf("Ghost completion scheduled seq=%d before_runes=%d after_runes=%d delay_ms=%d reveal=%t long=%t", requestSeq, len([]rune(context)), len([]rune(following)), delay.Milliseconds(), revealRequested, longMode)
+}
+
+func (ime *IME) startGhostCompletion(requestSeq uint64, context, following string, longMode bool) {
+	debugLogf("Ghost completion timer fired seq=%d", requestSeq)
+	ime.ghostMu.Lock()
+	if !ime.ghostEnabled || requestSeq != ime.ghostRequestSeq || context != ime.ghostContext || following != ime.ghostFollowingContext || longMode != ime.ghostLong || ime.ghostGenerator == nil {
+		ime.ghostMu.Unlock()
+		debugLogf("Ghost completion timer discarded seq=%d", requestSeq)
+		return
+	}
+	// The request path invalidates this sequence as soon as the user resumes
+	// typing. Do not call the Rime backend from this timer goroutine: librime is
+	// session-thread-bound and its State/GetCommit read can be destructive.
+	ime.ghostTimer = nil
+	ime.ghostPending = true
+	generator := ime.ghostGenerator
+	cfg := ime.ghostConfig
+	sender := ime.asyncResponseSender
+	ime.ghostMu.Unlock()
+
+	started := time.Now()
+	debugLogf("Ghost completion started seq=%d context_runes=%d", requestSeq, len([]rune(context)))
+	candidates, err := generator(aiCompletionRequest{Context: context, FollowingContext: following, Long: longMode}, cfg)
+
+	var updateResp *imecore.Response
+	ime.ghostMu.Lock()
+	if requestSeq == ime.ghostRequestSeq && context == ime.ghostContext && following == ime.ghostFollowingContext && longMode == ime.ghostLong {
+		ime.ghostPending = false
+		if err == nil {
+			maxRunes := ghostShortMaxRunes
+			if following != "" {
+				maxRunes = 20
+			} else if longMode {
+				maxRunes = ghostLongMaxRunes
+			}
+			ime.ghostCandidates = normalizeInlineCompletionsWithOptions(context, following, candidates, cfg.CandidateCount, maxRunes)
+			ime.ghostCandidateIndex = 0
+			ime.ghostReady = len(ime.ghostCandidates) > 0
+			if ime.ghostReady && ime.ghostRevealRequested {
+				ime.ghostVisible = true
+				updateResp = imecore.NewResponse(0, true)
+				ime.fillGhostResponseLocked(updateResp)
+			}
+		} else {
+			ime.resetGhostCompletionLocked()
+		}
+	}
+	ime.ghostMu.Unlock()
+	debugLogf("Ghost completion finished seq=%d elapsed=%s candidates=%d err=%v", requestSeq, time.Since(started), len(candidates), err)
+	if updateResp != nil && sender != nil {
+		sender(updateResp)
+	}
+}
+
+func committedGhostContext(documentBefore, compositionBeforeCommit, commit string) string {
+	documentBefore = strings.TrimSuffix(documentBefore, compositionBeforeCommit)
+	if commit == "" || strings.HasSuffix(documentBefore, commit) {
+		return documentBefore
+	}
+	return documentBefore + commit
+}
+
+func decodeGhostSurroundingText(payload string) (before, following string) {
+	if !strings.HasPrefix(payload, ghostContextEnvelope) {
+		return payload, ""
+	}
+	remainder := strings.TrimPrefix(payload, ghostContextEnvelope)
+	before, following, _ = strings.Cut(remainder, "\x1f")
+	return before, following
+}
+
+func (ime *IME) fillGhostResponseLocked(resp *imecore.Response) {
+	if resp == nil || !ime.ghostVisible || !ime.ghostReady {
+		return
+	}
+	if candidate := ime.currentGhostCandidateLocked(); candidate != "" {
+		resp.ShowMessage = &imecore.MessageWindow{Message: candidate, Duration: ghostMessageDuration}
+	}
+}
+
+func (ime *IME) currentGhostCandidateLocked() string {
+	if len(ime.ghostCandidates) == 0 {
+		return ""
+	}
+	if ime.ghostCandidateIndex < 0 || ime.ghostCandidateIndex >= len(ime.ghostCandidates) {
+		ime.ghostCandidateIndex = 0
+	}
+	return ime.ghostCandidates[ime.ghostCandidateIndex]
+}
+
+func (ime *IME) hasGhostWork() bool {
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	return ime.hasGhostWorkLocked()
+}
+
+func (ime *IME) hasGhostWorkLocked() bool {
+	return ime.ghostTimer != nil || ime.ghostPending || ime.ghostReady || ime.ghostVisible
+}
+
+func (ime *IME) resetGhostCompletion() {
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	ime.resetGhostCompletionLocked()
+}
+
+func (ime *IME) resetGhostCompletionLocked() {
+	ime.ghostRequestSeq++
+	if ime.ghostTimer != nil {
+		ime.ghostTimer.Stop()
+		ime.ghostTimer = nil
+	}
+	ime.ghostPending = false
+	ime.ghostReady = false
+	ime.ghostVisible = false
+	ime.ghostRevealRequested = false
+	ime.ghostCandidates = nil
+	ime.ghostCandidateIndex = 0
+	ime.ghostConsumeKeyUpCode = 0
+	ime.ghostContext = ""
+	ime.ghostFollowingContext = ""
+	ime.ghostLong = false
+	ime.ghostHidePending = false
+}
+
+func isLeftAlt(req *imecore.Request) bool {
+	if req == nil || req.KeyCode != vkMenu || req.IsExtended {
+		return false
+	}
+	return !req.KeyStates.IsKeyDown(vkControl)
+}
+
+func shouldInvalidateGhostForKey(req *imecore.Request) bool {
+	if req == nil || req.KeyCode == ghostActionKeyCode || isLeftAlt(req) {
+		return false
+	}
+	return req.CharCode >= 0x20 || req.KeyCode == vkBack || req.KeyCode == vkDelete || req.KeyCode == vkReturn || req.KeyCode == vkSpace || req.KeyCode == vkEscape || isCaretMovementKey(req.KeyCode)
+}
+
+func isGhostContextKey(req *imecore.Request) bool {
+	if req == nil || req.KeyCode == ghostActionKeyCode || isLeftAlt(req) {
+		return false
+	}
+	if req.KeyStates.IsKeyDown(vkControl) || req.KeyStates.IsKeyDown(vkMenu) {
+		return false
+	}
+	// Arrow/navigation key context is captured before the host moves the caret.
+	// It must invalidate an old completion but must not schedule from that stale
+	// snapshot. F8/Shift+F8 always fetch fresh context after the move.
+	return req.CharCode >= 0x20 || req.KeyCode == vkReturn || req.KeyCode == vkSpace
+}
+
+func isCaretMovementKey(keyCode int) bool {
+	switch keyCode {
+	case vkLeft, vkRight, vkUp, vkDown, vkHome, vkEnd, vkPrior, vkNext:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeCompletionContext(context string, tokenBudget int) string {
+	context = strings.ReplaceAll(context, "\x00", "")
+	context = strings.TrimSpace(context)
+	if context == "" {
+		return ""
+	}
+	runes := []rune(context)
+	start := tailSentenceStart(runes, ghostContextMaxSentences)
+	runes = runes[start:]
+	if tokenBudget <= 0 {
+		tokenBudget = 128
+	}
+	// Four units approximate one token: CJK consumes a token, while common
+	// ASCII text averages about four characters per token.
+	budgetUnits := tokenBudget * 4
+	used := 0
+	start = len(runes)
+	for start > 0 {
+		cost := completionRuneCost(runes[start-1])
+		if used+cost > budgetUnits {
+			break
+		}
+		used += cost
+		start--
+	}
+	return strings.TrimSpace(string(runes[start:]))
+}
+
+func normalizeFollowingCompletionContext(context string, tokenBudget int) string {
+	context = strings.TrimSpace(strings.ReplaceAll(context, "\x00", ""))
+	if context == "" {
+		return ""
+	}
+	if tokenBudget <= 0 {
+		tokenBudget = 64
+	}
+	runes := []rune(context)
+	used := 0
+	end := 0
+	sentences := 0
+	for end < len(runes) {
+		cost := completionRuneCost(runes[end])
+		if used+cost > tokenBudget*4 {
+			break
+		}
+		used += cost
+		if isSentenceTerminator(runes[end]) {
+			sentences++
+			if sentences == 2 {
+				end++
+				break
+			}
+		}
+		end++
+	}
+	return strings.TrimSpace(string(runes[:end]))
+}
+
+func tailSentenceStart(runes []rune, maxSentences int) int {
+	if maxSentences <= 0 {
+		return 0
+	}
+	boundaries := 0
+	for i := len(runes) - 1; i >= 0; i-- {
+		if !isSentenceTerminator(runes[i]) {
+			continue
+		}
+		if i == len(runes)-1 {
+			continue
+		}
+		boundaries++
+		if boundaries == maxSentences {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+func completionRuneCost(r rune) int {
+	if r <= unicode.MaxASCII {
+		return 1
+	}
+	return 4
+}
+
+func normalizeInlineCompletions(context string, candidates []string, limit int) []string {
+	return normalizeInlineCompletionsWithOptions(context, "", candidates, limit, 40)
+}
+
+func normalizeInlineCompletionsWithOptions(context, following string, candidates []string, limit, maxRunes int) []string {
+	if limit <= 0 {
+		limit = 3
+	}
+	context = strings.TrimSpace(context)
+	following = strings.TrimSpace(following)
+	result := make([]string, 0, limit)
+	seen := map[string]struct{}{}
+	for _, candidate := range candidates {
+		value := strings.TrimSpace(candidate)
+		value = strings.TrimLeft(value, "-*0123456789.、)） \t")
+		value = strings.TrimSpace(strings.Trim(value, `"'`))
+		for _, prefix := range []string{"续写：", "续写:", "候选：", "候选:"} {
+			value = strings.TrimSpace(strings.TrimPrefix(value, prefix))
+		}
+		if looksLikeAssistantReply(value) {
+			continue
+		}
+		if strings.HasPrefix(following, "的") && (looksLikeQuantityPhrase(value) || strings.HasSuffix(value, "产的") || strings.HasSuffix(value, "产地的")) {
+			continue
+		}
+		if value == "（无）" || value == "(无)" || value == "无" {
+			continue
+		}
+		if context != "" && strings.HasPrefix(value, context) {
+			value = strings.TrimSpace(strings.TrimPrefix(value, context))
+		}
+		value = trimLeadingContextOverlap(context, value)
+		value = trimEmbeddedFollowingOverlap(value, following)
+		value = trimTrailingFollowingOverlap(value, following)
+		value = trimRepeatedFollowingConnector(value, following)
+		value = collapsePathologicalRepetition(value)
+		if following == "" && maxRunes <= 20 {
+			value = trimRepeatedShortClauseTopic(context, value)
+			value = ensureShortCompletionSeparator(context, value)
+		}
+		longCompletion := following == "" && maxRunes == ghostLongMaxRunes
+		if longCompletion {
+			value = normalizeLongCompletionBoundary(value, maxRunes)
+		} else {
+			value = truncateCompletionAtSentence(value, maxRunes)
+		}
+		if len([]rune(value)) >= 4 && strings.Contains(context, value) {
+			continue
+		}
+		if longCompletion && looksLikeContextRestatement(context, value) {
+			continue
+		}
+		if following == "" && maxRunes <= 20 && looksLikeGenericCompletion(value) {
+			continue
+		}
+		if longCompletion {
+			value = ensureLongCompletionEnding(value, following, maxRunes)
+		}
+		if value == "" || strings.Trim(value, "。！？!?；;，,、 \t") == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+		if len(result) == limit {
+			break
+		}
+	}
+	return result
+}
+
+func ensureShortCompletionSeparator(context, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return value
+	}
+	value = trimInvalidSeparatorBeforeAttachedParticle(value)
+	if isAttachedShortContinuation(value) {
+		return value
+	}
+	first := []rune(value)[0]
+	switch first {
+	case '，', ',', '。', '！', '!', '？', '?', '；', ';', '：', ':', '、':
+		return value
+	}
+	tail := strings.TrimSpace(string(lastClauseRunes(context)))
+	for _, greeting := range []string{"你好", "您好", "大家好", "早上好", "上午好", "下午好", "晚上好", "晚安", "谢谢", "多谢", "抱歉", "对不起", "没关系", "再见", "辛苦了"} {
+		if tail == greeting {
+			return finishSeparatedShortClause("，" + value)
+		}
+	}
+	if hasCompletedShortPredicate(tail) {
+		plainValue := strings.Trim(value, "。！？!?；;，,、 ")
+		if len([]rune(plainValue)) >= 4 {
+			for _, r := range value {
+				if isSentenceTerminator(r) {
+					return finishSeparatedShortClause("，" + value)
+				}
+			}
+		}
+		for _, prefix := range []string{"令人", "让人", "整体", "同时", "而且", "并且", "不过", "但是", "但也", "此外", "另外", "因此", "所以", "非常", "十分", "格外", "特别", "确实", "口感", "香气", "风味", "酸度", "甜感", "余韵", "回甘", "层次"} {
+			if strings.HasPrefix(value, prefix) {
+				return finishSeparatedShortClause("，" + value)
+			}
+		}
+	}
+	if likelyCompleteShortClause(tail) && looksLikeIndependentShortClause(value) {
+		return finishSeparatedShortClause("，" + value)
+	}
+	return value
+}
+
+func trimInvalidSeparatorBeforeAttachedParticle(value string) string {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) < 2 {
+		return string(runes)
+	}
+	switch runes[0] {
+	case '，', ',', '；', ';', '：', ':', '、':
+		withoutSeparator := strings.TrimSpace(string(runes[1:]))
+		if isAttachedShortContinuation(withoutSeparator) {
+			return withoutSeparator
+		}
+	}
+	return string(runes)
+}
+
+func isAttachedShortContinuation(value string) bool {
+	value = strings.TrimSpace(value)
+	for _, prefix := range []string{"吗", "呢", "吧", "啊", "呀", "嘛", "么", "呗", "啦", "哦", "哟", "的", "地", "得", "了", "着", "过"} {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeIndependentShortClause(value string) bool {
+	value = strings.TrimLeft(strings.TrimSpace(value), "，,；;：:、 ")
+	for _, prefix := range []string{
+		"我是", "我有", "我会", "我想", "我觉得", "我认为", "我准备", "我打算", "我希望", "我需要", "我们",
+		"你是", "你有", "你会", "你想", "你觉得", "你可以", "你们",
+		"他是", "他有", "他会", "她是", "她有", "她会", "它是", "它有", "它会", "他们", "她们",
+		"这是", "那是", "今天", "明天", "现在", "接下来", "随后", "然后",
+		"令人", "让人", "整体", "同时", "而且", "并且", "不过", "但是", "但也", "此外", "另外", "因此", "所以",
+		"口感", "香气", "风味", "酸度", "甜感", "余韵", "回甘", "层次",
+	} {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func likelyCompleteShortClause(value string) bool {
+	value = strings.Trim(value, "。！？!?；;，,、：: ")
+	if len([]rune(value)) < 3 {
+		return false
+	}
+	for _, suffix := range []string{
+		"的", "地", "得", "和", "与", "或", "及", "以及", "把", "被", "向", "给", "从", "对", "为", "在",
+		"是", "有", "想", "要", "会", "能", "可以", "应该", "需要", "准备", "打算", "计划", "希望", "觉得", "认为", "发现", "看到", "听到",
+		"一个", "一种", "一杯", "一份", "一位", "一名", "这个", "那个", "因为", "如果", "虽然", "但是", "但", "而",
+	} {
+		if strings.HasSuffix(value, suffix) {
+			return false
+		}
+	}
+	for _, predicate := range []string{
+		"是", "有", "在", "叫", "姓", "觉得", "认为", "喜欢", "希望", "需要", "想", "会", "能", "可以", "应该",
+		"尝试", "喝", "吃", "用", "做", "去", "来", "看", "听", "说", "写", "发", "给", "让", "使", "带", "呈现", "表现", "包含", "具有", "显得", "变得",
+	} {
+		if strings.Contains(value, predicate) {
+			return true
+		}
+	}
+	return hasCompletedShortPredicate(value)
+}
+
+func trimRepeatedShortClauseTopic(context, value string) string {
+	tail := strings.TrimSpace(string(lastClauseRunes(context)))
+	for _, topic := range []string{"口感", "香气", "风味", "酸度", "甜感", "余韵", "回甘", "层次"} {
+		if strings.Contains(tail, topic) && strings.HasPrefix(value, topic) {
+			if rest := strings.TrimSpace(strings.TrimPrefix(value, topic)); rest != "" {
+				return rest
+			}
+		}
+	}
+	return value
+}
+
+func hasCompletedShortPredicate(value string) bool {
+	plain := strings.Trim(value, "。！？!?；;，,、 ")
+	for _, ending := range []string{"和谐", "浓郁", "丰富", "清晰", "明亮", "清爽", "顺滑", "干净", "独特", "自然", "流畅", "稳定", "成熟", "完整", "明显", "突出", "开心", "高兴", "满意", "惊喜", "舒服", "漂亮", "方便", "简单", "困难", "重要", "合适", "回甘", "柔和", "饱满", "持久", "悠长", "平衡", "扎实", "细腻", "醇厚", "清甜", "鲜明", "舒适", "愉悦"} {
+		if strings.HasSuffix(plain, ending) {
+			return true
+		}
+	}
+	return false
+}
+
+func finishSeparatedShortClause(value string) string {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) == 0 || isSentenceTerminator(runes[len(runes)-1]) {
+		return string(runes)
+	}
+	plain := strings.TrimLeft(string(runes), "，,；;：:、 ")
+	if !hasCompletedShortPredicate(plain) && !likelyCompleteShortClause(plain) {
+		return string(runes)
+	}
+	return string(runes) + "。"
+}
+
+func normalizeLongCompletionBoundary(value string, maxRunes int) string {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) == 0 {
+		return ""
+	}
+	for i, r := range runes {
+		if !isSentenceTerminator(r) {
+			continue
+		}
+		if maxRunes > 0 && i+1 > maxRunes {
+			return ""
+		}
+		return strings.TrimSpace(string(runes[:i+1]))
+	}
+	// Never manufacture a full stop after cutting through a sentence. A short
+	// punctuation-less line may merely have omitted its final full stop, but an
+	// over-limit line is an incomplete model response and should not be shown.
+	if maxRunes > 0 && len(runes) > maxRunes {
+		return ""
+	}
+	return string(runes)
+}
+
+func looksLikeQuantityPhrase(value string) bool {
+	value = strings.TrimSpace(value)
+	for _, prefix := range []string{"一杯", "两杯", "三杯", "半杯", "一壶", "两壶", "一款", "一种", "一份", "一袋", "一盒", "一瓶"} {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func trimEmbeddedFollowingOverlap(value, following string) string {
+	if value == "" || following == "" {
+		return value
+	}
+	for size := len([]rune(following)); size >= 3; size-- {
+		prefix := string([]rune(following)[:size])
+		if index := strings.Index(value, prefix); index >= 0 {
+			return strings.TrimSpace(value[:index])
+		}
+	}
+	return value
+}
+
+func trimRepeatedFollowingConnector(value, following string) string {
+	valueRunes, followingRunes := []rune(strings.TrimSpace(value)), []rune(strings.TrimSpace(following))
+	if len(valueRunes) == 0 || len(followingRunes) == 0 || valueRunes[len(valueRunes)-1] != followingRunes[0] {
+		return value
+	}
+	switch followingRunes[0] {
+	case '的', '地', '得', '了', '着', '过', '和', '与', '或', '，', ',', '、', '：', ':':
+		return strings.TrimSpace(string(valueRunes[:len(valueRunes)-1]))
+	default:
+		return value
+	}
+}
+
+func looksLikeGenericCompletion(value string) bool {
+	plain := strings.Trim(value, "。！？!?；;，,、 ")
+	for _, phrase := range []string{"回味无穷", "令人难忘", "非常不错", "很有意思", "值得一试", "值得推荐", "推荐入手", "下次再来", "口感不错", "风味不错", "独具魅力", "韵味十足", "别有一番风味", "让人印象深刻", "完美诠释"} {
+		if strings.Contains(plain, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeContextRestatement(context, value string) bool {
+	left := lastClauseRunes(context)
+	right := firstClauseRunes(value)
+	if len(left) < 4 || len(right) < len(left) {
+		return false
+	}
+	return longestCommonSubsequenceLength(left, right)*100 >= len(left)*75
+}
+
+func lastClauseRunes(value string) []rune {
+	runes := []rune(strings.TrimSpace(value))
+	start := 0
+	for i, r := range runes {
+		if isSentenceTerminator(r) || r == '，' || r == ',' || r == '：' || r == ':' {
+			start = i + 1
+		}
+	}
+	return []rune(strings.TrimSpace(string(runes[start:])))
+}
+
+func firstClauseRunes(value string) []rune {
+	runes := []rune(strings.TrimSpace(value))
+	for i, r := range runes {
+		if isSentenceTerminator(r) || r == '，' || r == ',' || r == '：' || r == ':' {
+			return []rune(strings.TrimSpace(string(runes[:i])))
+		}
+	}
+	return runes
+}
+
+func longestCommonSubsequenceLength(a, b []rune) int {
+	previous := make([]int, len(b)+1)
+	for _, left := range a {
+		current := make([]int, len(b)+1)
+		for j, right := range b {
+			if left == right {
+				current[j+1] = previous[j] + 1
+			} else if current[j] > previous[j+1] {
+				current[j+1] = current[j]
+			} else {
+				current[j+1] = previous[j+1]
+			}
+		}
+		previous = current
+	}
+	return previous[len(b)]
+}
+
+func ensureLongCompletionEnding(value, following string, maxRunes int) string {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) == 0 || isSentenceTerminator(runes[len(runes)-1]) {
+		return string(runes)
+	}
+	after := []rune(strings.TrimSpace(following))
+	if len(after) > 0 && isSentenceTerminator(after[0]) {
+		return string(runes)
+	}
+	if maxRunes > 1 && len(runes) >= maxRunes {
+		runes = runes[:maxRunes-1]
+	}
+	return string(runes) + "。"
+}
+
+func hasUnsafeInlineBoundary(context, following string) bool {
+	left := []rune(strings.TrimSpace(context))
+	right := []rune(strings.TrimSpace(following))
+	if len(left) == 0 || len(right) == 0 {
+		return false
+	}
+	a, b := left[len(left)-1], right[0]
+	// A caret inside or immediately beside an ASCII word/model/product token
+	// is usually an editing position, not a natural insertion boundary. This
+	// prevents cases such as “肯尼亚|AA” from receiving a Chinese phrase.
+	return isASCIIWordRune(a) || isASCIIWordRune(b)
+}
+
+func isASCIIWordRune(r rune) bool {
+	return r <= unicode.MaxASCII && (unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-')
+}
+
+func trimLeadingContextOverlap(context, value string) string {
+	left := []rune(context)
+	for {
+		right := []rune(value)
+		max := len(left)
+		if len(right) < max {
+			max = len(right)
+		}
+		removed := false
+		for size := max; size >= 2; size-- {
+			if string(left[len(left)-size:]) == string(right[:size]) {
+				value = strings.TrimSpace(string(right[size:]))
+				removed = true
+				break
+			}
+		}
+		if !removed || value == "" {
+			return value
+		}
+	}
+}
+
+func trimTrailingFollowingOverlap(value, following string) string {
+	left, right := []rune(value), []rune(following)
+	max := len(left)
+	if len(right) < max {
+		max = len(right)
+	}
+	for size := max; size >= 2; size-- {
+		if string(left[len(left)-size:]) == string(right[:size]) {
+			return strings.TrimSpace(string(left[:len(left)-size]))
+		}
+	}
+	return value
+}
+
+func collapsePathologicalRepetition(value string) string {
+	runes := []rune(value)
+	if len(runes) < 4 {
+		return value
+	}
+	out := make([]rune, 0, len(runes))
+	for i := 0; i < len(runes); {
+		collapsed := false
+		maxUnit := 8
+		if remaining := (len(runes) - i) / 2; remaining < maxUnit {
+			maxUnit = remaining
+		}
+		for unit := 2; unit <= maxUnit; unit++ {
+			count := 1
+			for i+(count+1)*unit <= len(runes) && string(runes[i:i+unit]) == string(runes[i+count*unit:i+(count+1)*unit]) {
+				count++
+			}
+			if count >= 2 {
+				out = append(out, runes[i:i+unit]...)
+				i += count * unit
+				collapsed = true
+				break
+			}
+		}
+		if collapsed {
+			continue
+		}
+		count := 1
+		for i+count < len(runes) && runes[i+count] == runes[i] {
+			count++
+		}
+		if count >= 5 {
+			out = append(out, runes[i], runes[i])
+			i += count
+			continue
+		}
+		out = append(out, runes[i])
+		i++
+	}
+	return string(out)
+}
+
+func looksLikeAssistantReply(value string) bool {
+	lower := strings.ToLower(value)
+	for _, phrase := range []string{"我是你的智能助手", "我是您的智能助手", "我是你的助手", "我是您的助手", "有什么可以帮", "无法确定", "无法生成", "需要更多上下文", "请提供完整", "请补充", "how can i help", "as an ai"} {
+		if strings.Contains(lower, strings.ToLower(phrase)) {
+			return true
+		}
+	}
+	return false
+}
+
+func truncateCompletionAtSentence(value string, maxRunes int) string {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) == 0 {
+		return ""
+	}
+	end := len(runes)
+	for i, r := range runes {
+		if isSentenceTerminator(r) {
+			end = i + 1
+			break
+		}
+	}
+	if maxRunes > 0 && end > maxRunes {
+		end = maxRunes
+	}
+	value = strings.TrimSpace(string(runes[:end]))
+	if !utf8.ValidString(value) {
+		return ""
+	}
+	return value
+}
+
+func isSentenceTerminator(r rune) bool {
+	switch r {
+	case '。', '！', '？', '!', '?', '；', ';', '\n', '\r':
+		return true
+	default:
+		return false
+	}
+}

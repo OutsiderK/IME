@@ -1,0 +1,39 @@
+/////////////////////////////////////////////////////////////////////////////
+//
+// Version
+//
+
+#pragma code_page(65001)
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @MOQI_VERSION_MAJOR@,@MOQI_VERSION_MINOR@,@MOQI_VERSION_PATCH@
+ PRODUCTVERSION @MOQI_VERSION_MAJOR@,@MOQI_VERSION_MINOR@,@MOQI_VERSION_PATCH@
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x40004L
+ FILETYPE 0x0L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "Moqi"
+            VALUE "FileDescription", "墨奇输入法"
+            VALUE "FileVersion", "@MOQI_VERSION_MAJOR@.@MOQI_VERSION_MINOR@.@MOQI_VERSION_PATCH@"
+            VALUE "InternalName", "MoqiLauncher.exe"
+            VALUE "LegalCopyright", "Copyright (C) 2013-2016 Moqi developers"
+            VALUE "OriginalFilename", "MoqiLauncher.exe"
+            VALUE "ProductName", "墨奇输入法"
+            VALUE "ProductVersion", "@MOQI_VERSION_MAJOR@.@MOQI_VERSION_MINOR@.@MOQI_VERSION_PATCH@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

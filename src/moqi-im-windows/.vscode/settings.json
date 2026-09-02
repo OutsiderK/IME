@@ -1,0 +1,5 @@
+{
+  "cmake.buildDirectory": "${workspaceFolder}/cmake-build-ninja",
+  "cmake.generator": "Ninja",
+  "git.pullTags": false
+}

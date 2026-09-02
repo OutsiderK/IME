@@ -1,0 +1,401 @@
+//go:build windows
+
+package rime
+
+import (
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gaboolic/moqi-ime/imecore"
+)
+
+func realRimeTestDirs(t *testing.T) (string, string) {
+	t.Helper()
+
+	appData := os.Getenv("MOQI_REAL_APPDATA")
+	if appData == "" {
+		appData = os.Getenv("APPDATA")
+	}
+	if appData == "" {
+		t.Skip("APPDATA is not set")
+	}
+	userDir := filepath.Join(appData, APP, "Rime")
+	if info, err := os.Stat(userDir); err != nil || !info.IsDir() {
+		t.Skipf("existing user Rime directory is required: %q err=%v isDir=%t", userDir, err, err == nil && info.IsDir())
+	}
+
+	dataDirCandidates := []string{
+		filepath.Join(`C:\Program Files (x86)\MoqiIM\moqi-ime`, "input_methods", "rime", "data"),
+		filepath.Join(`D:\vscode\moqi-input-method-projs\moqi-ime`, "input_methods", "rime", "data"),
+	}
+	for _, dataDir := range dataDirCandidates {
+		if info, err := os.Stat(dataDir); err == nil && info.IsDir() {
+			return dataDir, userDir
+		}
+	}
+	t.Skip("usable Rime data directory is required")
+	return "", ""
+}
+
+func newRealRimeSession(t *testing.T) RimeSessionId {
+	t.Helper()
+
+	dataDir, userDir := realRimeTestDirs(t)
+
+	if !RimeInit(dataDir, userDir, APP, APP_VERSION, false) {
+		t.Fatal("RimeInit failed")
+	}
+
+	sessionID, ok := StartSession()
+	if !ok || sessionID == 0 {
+		t.Fatal("StartSession failed")
+	}
+	t.Cleanup(func() {
+		EndSession(sessionID)
+		Finalize()
+	})
+	t.Logf("ascii_mode before typing: %t", GetOption(sessionID, "ascii_mode"))
+	t.Logf("full_shape before typing: %t", GetOption(sessionID, "full_shape"))
+	SetOption(sessionID, "ascii_mode", false)
+	t.Logf("ascii_mode after forcing off: %t", GetOption(sessionID, "ascii_mode"))
+	return sessionID
+}
+
+func TestRealRimeInitDuration(t *testing.T) {
+	dataDir, userDir := realRimeTestDirs(t)
+
+	start := time.Now()
+	if !RimeInit(dataDir, userDir, APP, APP_VERSION, false) {
+		t.Fatal("RimeInit failed")
+	}
+	elapsed := time.Since(start)
+	t.Cleanup(Finalize)
+
+	t.Logf("RimeInit(fullcheck=false) took %s using dataDir=%q userDir=%q", elapsed, dataDir, userDir)
+
+	maxMillisText := strings.TrimSpace(os.Getenv("MOQI_RIME_INIT_MAX_MS"))
+	if maxMillisText == "" {
+		return
+	}
+	maxMillis, err := strconv.Atoi(maxMillisText)
+	if err != nil {
+		t.Fatalf("invalid MOQI_RIME_INIT_MAX_MS value %q: %v", maxMillisText, err)
+	}
+	maxDuration := time.Duration(maxMillis) * time.Millisecond
+	if elapsed > maxDuration {
+		t.Fatalf("RimeInit(fullcheck=false) took %s, exceeded limit %s", elapsed, maxDuration)
+	}
+}
+
+func TestRealRimeCanCommitText(t *testing.T) {
+	sessionID := newRealRimeSession(t)
+
+	for _, input := range []string{"nihao", "xpxp", "gegegojxyzgegegojxdegoge"} {
+		t.Run(input, func(t *testing.T) {
+			ClearComposition(sessionID)
+			for _, key := range []rune(input) {
+				if !ProcessKey(sessionID, int(key), 0) {
+					if composition, ok := GetComposition(sessionID); ok {
+						t.Logf("composition after failed %q: %#v", key, composition)
+					}
+					if menu, ok := GetMenu(sessionID); ok {
+						t.Logf("menu after failed %q: %#v", key, menu)
+					}
+					t.Fatalf("ProcessKey failed for %q", key)
+				}
+			}
+
+			menu, ok := GetMenu(sessionID)
+			if !ok || len(menu.Candidates) == 0 {
+				t.Fatalf("expected candidates after %s, got %#v", input, menu)
+			}
+			t.Logf("candidates after %s: %#v", input, menu.Candidates)
+
+			if !ProcessKey(sessionID, int(' '), 0) {
+				t.Fatal("ProcessKey failed for space")
+			}
+
+			commit, ok := GetCommit(sessionID)
+			if !ok {
+				t.Fatal("expected commit after space")
+			}
+			t.Logf("commit text for %s: %q", input, commit.Text)
+
+			if commit.Text == "" || commit.Text == input {
+				t.Fatalf("expected converted text commit for %s, got %q", input, commit.Text)
+			}
+		})
+	}
+}
+
+func TestRealRimeGraveSeparatorParticipatesInComposition(t *testing.T) {
+	sessionID := newRealRimeSession(t)
+	ClearComposition(sessionID)
+	if !SelectSchema(sessionID, "rime_frost") {
+		t.Fatal("SelectSchema(rime_frost) failed")
+	}
+	SetOption(sessionID, "ascii_mode", false)
+	t.Logf("schema before typing: %q", GetCurrentSchema(sessionID))
+
+	steps := []struct {
+		name string
+		req  *imecore.Request
+	}{
+		{name: "m", req: &imecore.Request{KeyCode: int('m'), CharCode: int('m')}},
+		{name: "o", req: &imecore.Request{KeyCode: int('o'), CharCode: int('o')}},
+		{name: "grave", req: &imecore.Request{KeyCode: vkOem3, CharCode: int('`')}},
+		{name: "l", req: &imecore.Request{KeyCode: int('l'), CharCode: int('l')}},
+	}
+
+	for _, step := range steps {
+		handled := processRealKey(sessionID, step.req)
+		rawInput := GetInput(sessionID)
+		commit, _ := GetCommit(sessionID)
+		composition, _ := GetComposition(sessionID)
+		menu, _ := GetMenu(sessionID)
+		t.Logf("step=%s handled=%t rawInput=%q commit=%q preedit=%q candidates=%v",
+			step.name, handled, rawInput, commit.Text, composition.Preedit, menu.Candidates)
+		if !handled {
+			t.Fatalf("expected step %s to be handled", step.name)
+		}
+		if commit.Text != "" {
+			t.Fatalf("expected step %s to stay in composition, got commit %q", step.name, commit.Text)
+		}
+	}
+
+	if composition, ok := GetComposition(sessionID); !ok || composition.Preedit != "mo`l" {
+		t.Fatalf("expected composition to contain grave separator, got ok=%t composition=%#v", ok, composition)
+	}
+	if menu, ok := GetMenu(sessionID); !ok || len(menu.Candidates) == 0 {
+		t.Fatalf("expected candidates for mo`l, got ok=%t menu=%#v", ok, menu)
+	}
+}
+
+func TestRealRimeFlypyGraveAuxLookupHasCandidates(t *testing.T) {
+	sessionID := newRealRimeSession(t)
+	if !SelectSchema(sessionID, "rime_frost_double_pinyin_flypy") {
+		t.Fatal("SelectSchema(rime_frost_double_pinyin_flypy) failed")
+	}
+	SetOption(sessionID, "ascii_mode", false)
+
+	ClearComposition(sessionID)
+	steps := []*imecore.Request{
+		{KeyCode: int('m'), CharCode: int('m')},
+		{KeyCode: int('o'), CharCode: int('o')},
+		{KeyCode: vkOem3, CharCode: int('`')},
+		{KeyCode: int('l'), CharCode: int('l')},
+	}
+	for _, req := range steps {
+		if !processRealKey(sessionID, req) {
+			t.Fatalf("ProcessKey failed for keyCode=%d charCode=%d", req.KeyCode, req.CharCode)
+		}
+	}
+	composition, _ := GetComposition(sessionID)
+	menu, _ := GetMenu(sessionID)
+	t.Logf("preedit=%q candidates=%v", composition.Preedit, menu.Candidates)
+	if composition.Preedit != "mo`l" {
+		t.Fatalf("expected preedit %q, got %q", "mo`l", composition.Preedit)
+	}
+	if len(menu.Candidates) == 0 {
+		t.Fatalf("expected candidates for flypy grave aux lookup, got %v", menu.Candidates)
+	}
+}
+
+func TestRealRimeControlShortcuts(t *testing.T) {
+	sessionID := newRealRimeSession(t)
+
+	tests := []struct {
+		name string
+		req  *imecore.Request
+	}{
+		{
+			name: "ctrl+a",
+			req: &imecore.Request{
+				KeyCode:   'A',
+				CharCode:  1,
+				KeyStates: keyStatesDown(vkControl),
+			},
+		},
+		{
+			name: "ctrl+grave",
+			req: &imecore.Request{
+				KeyCode:   0xC0,
+				CharCode:  '`',
+				KeyStates: keyStatesDown(vkControl),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ClearComposition(sessionID)
+
+			translatedKey := translateKeyCode(tc.req)
+			modifiers := translateModifiers(tc.req, false)
+			handled := ProcessKey(sessionID, translatedKey, modifiers)
+
+			t.Logf("request: keyCode=%d charCode=%d translatedKey=%d modifiers=%d handled=%t",
+				tc.req.KeyCode, tc.req.CharCode, translatedKey, modifiers, handled)
+
+			if composition, ok := GetComposition(sessionID); ok {
+				t.Logf("composition: %#v", composition)
+			} else {
+				t.Log("composition: <none>")
+			}
+
+			if menu, ok := GetMenu(sessionID); ok {
+				t.Logf("menu: %#v", menu)
+			} else {
+				t.Log("menu: <none>")
+			}
+
+			if commit, ok := GetCommit(sessionID); ok {
+				t.Logf("commit: %#v", commit)
+			} else {
+				t.Log("commit: <none>")
+			}
+		})
+	}
+}
+
+func TestRealRimeBackspaceUpdatesComposition(t *testing.T) {
+	sessionID := newRealRimeSession(t)
+	ClearComposition(sessionID)
+
+	typeASCII(t, sessionID, "ni")
+	before, ok := GetComposition(sessionID)
+	if !ok || before.Preedit == "" {
+		t.Fatalf("expected composition before backspace, got %#v", before)
+	}
+
+	handled := processRealKey(sessionID, &imecore.Request{KeyCode: vkBack})
+	after, ok := GetComposition(sessionID)
+	if !handled {
+		t.Fatal("expected backspace to be handled")
+	}
+	if !ok || after.Preedit == "" {
+		t.Fatalf("expected composition to remain after backspace, got %#v", after)
+	}
+	if len([]rune(after.Preedit)) >= len([]rune(before.Preedit)) {
+		t.Fatalf("expected shorter composition after backspace, before=%q after=%q", before.Preedit, after.Preedit)
+	}
+	if menu, ok := GetMenu(sessionID); !ok || len(menu.Candidates) == 0 {
+		t.Fatalf("expected candidates to remain after backspace, got %#v", menu)
+	}
+}
+
+func TestRealRimeEscapeClearsComposition(t *testing.T) {
+	sessionID := newRealRimeSession(t)
+	ClearComposition(sessionID)
+
+	typeASCII(t, sessionID, "ni")
+	if composition, ok := GetComposition(sessionID); !ok || composition.Preedit == "" {
+		t.Fatalf("expected composition before escape, got %#v", composition)
+	}
+
+	handled := processRealKey(sessionID, &imecore.Request{KeyCode: vkEscape})
+	composition, compositionOK := GetComposition(sessionID)
+	menu, menuOK := GetMenu(sessionID)
+	if !handled {
+		t.Fatal("expected escape to be handled")
+	}
+	if !compositionOK || composition.Preedit != "" {
+		t.Fatalf("expected escape to clear composition, got %#v", composition)
+	}
+	if menuOK && len(menu.Candidates) != 0 {
+		t.Fatalf("expected escape to clear candidates, got %#v", menu)
+	}
+}
+
+func TestRealRimePunctuationKeys(t *testing.T) {
+	sessionID := newRealRimeSession(t)
+
+	tests := []struct {
+		name          string
+		req           *imecore.Request
+		allowedCommit []string
+	}{
+		{
+			name: "grave",
+			req: &imecore.Request{
+				KeyCode:  0xC0,
+				CharCode: '`',
+			},
+			allowedCommit: []string{"、", "`", "｀"},
+		},
+		{
+			name: "pipe",
+			req: &imecore.Request{
+				KeyCode:  0xDC,
+				CharCode: '|',
+			},
+			allowedCommit: []string{"|", "·", "｜"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ClearComposition(sessionID)
+
+			handled := processRealKey(sessionID, tc.req)
+			commit, commitOK := GetCommit(sessionID)
+			composition, compositionOK := GetComposition(sessionID)
+			menu, menuOK := GetMenu(sessionID)
+
+			t.Logf("request=%s handled=%t commit=%#v composition=%#v menu=%#v", tc.name, handled, commit, composition, menu)
+
+			if !handled {
+				t.Fatalf("expected %s key to be handled", tc.name)
+			}
+			if commitOK && commit.Text != "" {
+				if !containsAny(tc.allowedCommit, commit.Text) {
+					t.Fatalf("unexpected commit for %s: %q", tc.name, commit.Text)
+				}
+				return
+			}
+			if compositionOK && composition.Preedit != "" {
+				return
+			}
+			if menuOK && len(menu.Candidates) > 0 {
+				return
+			}
+			t.Fatalf("expected %s key to produce visible output", tc.name)
+		})
+	}
+}
+
+func keyStatesDown(codes ...int) imecore.KeyStates {
+	states := make(imecore.KeyStates, 256)
+	for _, code := range codes {
+		if code >= 0 && code < len(states) {
+			states[code] = 1 << 7
+		}
+	}
+	return states
+}
+
+func processRealKey(sessionID RimeSessionId, req *imecore.Request) bool {
+	return ProcessKey(sessionID, translateKeyCode(req), translateModifiers(req, false))
+}
+
+func typeASCII(t *testing.T, sessionID RimeSessionId, input string) {
+	t.Helper()
+	for _, key := range input {
+		if !ProcessKey(sessionID, int(key), 0) {
+			t.Fatalf("ProcessKey failed for %q", key)
+		}
+	}
+}
+
+func containsAny(candidates []string, got string) bool {
+	for _, candidate := range candidates {
+		if strings.Contains(got, candidate) {
+			return true
+		}
+	}
+	return false
+}

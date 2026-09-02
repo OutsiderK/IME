@@ -1,0 +1,35 @@
+# Local build and tool caches
+/.cache/
+/build/
+/tools/
+
+# Local AI model and runtime data
+/local-ai/models/
+/local-ai/logs/
+*.gguf
+
+# Generated archives and installers
+*.zip
+*.7z
+*.rar
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+*.lib
+
+# CMake and IDE-generated files
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+build_*/
+build-*/
+installer/stage/
+.vs/
+
+# Local operating-system files
+Thumbs.db
+Desktop.ini
+*.log
+
