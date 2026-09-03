@@ -16,6 +16,7 @@ const (
 	ghostShortMaxRunes        = 16
 	ghostLongMaxRunes         = 56
 	ghostContextMaxSentences  = 6
+	defaultGhostLoadingDelay  = time.Second
 	ghostPreservedKeyGUID     = "{7b5cfb72-41d8-4c76-a819-65b698f91a34}"
 	ghostLongPreservedKeyGUID = "{018e48c0-a24f-4b72-bacc-57a2d53284b9}"
 	ghostNextPreservedKeyGUID = "{316649a5-9c0b-4708-a43d-7bedc5bde9bb}"
@@ -104,7 +105,7 @@ func (ime *IME) handleGhostKeyDownFilter(req *imecore.Request, resp *imecore.Res
 		return true
 	}
 	if shouldInvalidateGhostForKey(req) && ime.hasGhostWorkLocked() {
-		wasVisible := ime.ghostVisible
+		wasVisible := ime.ghostVisible || ime.ghostLoadingVisible
 		ime.resetGhostCompletionLocked()
 		if wasVisible {
 			ime.ghostHidePending = true
@@ -229,7 +230,7 @@ func (ime *IME) handleGhostPreservedKey(req *imecore.Request, resp *imecore.Resp
 	}
 	modeMatches := surroundingMatches && longMode == ime.ghostLong
 	if !ime.hasGhostWorkLocked() || (normalizedBefore != "" && !modeMatches) {
-		hadVisible := ime.ghostVisible
+		hadVisible := ime.ghostVisible || ime.ghostLoadingVisible
 		ime.ghostMu.Unlock()
 		if normalizedBefore == "" {
 			resp.ReturnValue = 0
@@ -238,7 +239,6 @@ func (ime *IME) handleGhostPreservedKey(req *imecore.Request, resp *imecore.Resp
 		// F8 is also an on-demand trigger. This makes completion available after
 		// mouse caret moves and in text that was not entered through Moqi.
 		ime.scheduleGhostCompletionForSurrounding(before, following, true, 0, longMode)
-		resp.ShowMessage = &imecore.MessageWindow{Message: "本地 AI 正在准备…", Duration: ghostMessageDuration}
 		if hadVisible {
 			resp.HideMessage = true
 		}
@@ -285,7 +285,7 @@ func (ime *IME) performGhostActionLocked(resp *imecore.Response) bool {
 		ime.ghostVisible = true
 		ime.fillGhostResponseLocked(resp)
 	} else {
-		ime.ghostRevealRequested = true
+		ime.requestGhostRevealLocked()
 	}
 	resp.ReturnValue = 1
 	return true
@@ -357,7 +357,7 @@ func (ime *IME) scheduleGhostCompletionForSurrounding(rawContext, rawFollowing s
 	}
 	if context == ime.ghostContext && following == ime.ghostFollowingContext && longMode == ime.ghostLong && ime.hasGhostWorkLocked() {
 		if revealRequested {
-			ime.ghostRevealRequested = true
+			ime.requestGhostRevealLocked()
 		}
 		return
 	}
@@ -376,7 +376,57 @@ func (ime *IME) scheduleGhostCompletionForSurrounding(rawContext, rawFollowing s
 	ime.ghostTimer = time.AfterFunc(delay, func() {
 		ime.startGhostCompletion(requestSeq, context, following, longMode)
 	})
+	if revealRequested {
+		ime.scheduleGhostLoadingMessageLocked()
+	}
 	debugLogf("Ghost completion scheduled seq=%d before_runes=%d after_runes=%d delay_ms=%d reveal=%t long=%t", requestSeq, len([]rune(context)), len([]rune(following)), delay.Milliseconds(), revealRequested, longMode)
+}
+
+func (ime *IME) requestGhostRevealLocked() {
+	ime.ghostRevealRequested = true
+	ime.scheduleGhostLoadingMessageLocked()
+}
+
+func (ime *IME) scheduleGhostLoadingMessageLocked() {
+	if !ime.ghostRevealRequested || ime.ghostReady || ime.ghostLoadingVisible ||
+		ime.ghostLoadingTimer != nil || (ime.ghostTimer == nil && !ime.ghostPending) {
+		return
+	}
+	delay := ime.ghostLoadingDelay
+	if delay <= 0 {
+		delay = defaultGhostLoadingDelay
+	}
+	requestSeq := ime.ghostRequestSeq
+	context := ime.ghostContext
+	following := ime.ghostFollowingContext
+	longMode := ime.ghostLong
+	ime.ghostLoadingTimer = time.AfterFunc(delay, func() {
+		ime.showGhostLoadingMessage(requestSeq, context, following, longMode)
+	})
+}
+
+func (ime *IME) showGhostLoadingMessage(requestSeq uint64, context, following string, longMode bool) {
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	if !ime.ghostEnabled || requestSeq != ime.ghostRequestSeq ||
+		context != ime.ghostContext || following != ime.ghostFollowingContext ||
+		longMode != ime.ghostLong || !ime.ghostRevealRequested || ime.ghostReady ||
+		(ime.ghostTimer == nil && !ime.ghostPending) {
+		return
+	}
+	ime.ghostLoadingTimer = nil
+	if ime.asyncResponseSender == nil {
+		return
+	}
+	ime.ghostLoadingVisible = true
+	resp := imecore.NewResponse(0, true)
+	resp.ShowMessage = &imecore.MessageWindow{
+		Message:  "本地 AI 正在准备…",
+		Duration: ghostMessageDuration,
+	}
+	// Serialize the visibility transition with cancellation. If typing resets
+	// this request next, its synchronous response will always hide this window.
+	ime.asyncResponseSender(resp)
 }
 
 func (ime *IME) startGhostCompletion(requestSeq uint64, context, following string, longMode bool) {
@@ -405,6 +455,12 @@ func (ime *IME) startGhostCompletion(requestSeq uint64, context, following strin
 	ime.ghostMu.Lock()
 	if requestSeq == ime.ghostRequestSeq && context == ime.ghostContext && following == ime.ghostFollowingContext && longMode == ime.ghostLong {
 		ime.ghostPending = false
+		if ime.ghostLoadingTimer != nil {
+			ime.ghostLoadingTimer.Stop()
+			ime.ghostLoadingTimer = nil
+		}
+		loadingWasVisible := ime.ghostLoadingVisible
+		ime.ghostLoadingVisible = false
 		if err == nil {
 			maxRunes := ghostShortMaxRunes
 			if following != "" {
@@ -419,6 +475,12 @@ func (ime *IME) startGhostCompletion(requestSeq uint64, context, following strin
 				ime.ghostVisible = true
 				updateResp = imecore.NewResponse(0, true)
 				ime.fillGhostResponseLocked(updateResp)
+			} else if loadingWasVisible {
+				updateResp = imecore.NewResponse(0, true)
+				updateResp.HideMessage = true
+			}
+			if !ime.ghostReady {
+				ime.ghostRevealRequested = false
 			}
 		} else {
 			if ime.ghostRevealRequested {
@@ -500,7 +562,8 @@ func (ime *IME) hasGhostWork() bool {
 }
 
 func (ime *IME) hasGhostWorkLocked() bool {
-	return ime.ghostTimer != nil || ime.ghostPending || ime.ghostReady || ime.ghostVisible
+	return ime.ghostTimer != nil || ime.ghostLoadingTimer != nil || ime.ghostPending ||
+		ime.ghostReady || ime.ghostVisible || ime.ghostLoadingVisible
 }
 
 func (ime *IME) resetGhostCompletion() {
@@ -515,6 +578,11 @@ func (ime *IME) resetGhostCompletionLocked() {
 		ime.ghostTimer.Stop()
 		ime.ghostTimer = nil
 	}
+	if ime.ghostLoadingTimer != nil {
+		ime.ghostLoadingTimer.Stop()
+		ime.ghostLoadingTimer = nil
+	}
+	ime.ghostLoadingVisible = false
 	ime.ghostPending = false
 	ime.ghostReady = false
 	ime.ghostVisible = false

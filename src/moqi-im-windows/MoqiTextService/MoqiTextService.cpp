@@ -320,6 +320,7 @@ TextService::TextService(ImeModule* module):
 	client_(nullptr),
 	messageWindow_(nullptr),
 	messageTimerId_(0),
+	ghostInlinePreferred_(true),
 	validCandidateListElementId_(false),
 	candidateListElementId_(0),
 	shouldShowCandidateWindowUI_(true),
@@ -1104,16 +1105,13 @@ void TextService::showMessage(Ime::EditSession* session, std::wstring message, i
 	messageWindow_ = make_unique<Ime::MessageWindow>(this, session);
 	const bool isGhost = duration < 0;
 	messageWindow_->setGhostStyle(isGhost);
+	if (isGhost) {
+		messageWindow_->setGhostAppearance(
+			candCommentColor_, candBackgroundColor_, RGB(213, 222, 221));
+	}
 	messageWindow_->setFont(font_);
 	messageWindow_->setText(message);
-	
-	int x = 0, y = 0;
-	RECT rc;
-	if(inputRect(session, &rc)) {
-		x = rc.left;
-		y = rc.bottom;
-	}
-	messageWindow_->move(x, y);
+	moveMessageWindowToInputRect(session);
 	messageWindow_->show();
 
 	if (duration > 0) {
@@ -1122,13 +1120,64 @@ void TextService::showMessage(Ime::EditSession* session, std::wstring message, i
 }
 
 void TextService::updateMessageWindow(Ime::EditSession* session) {
-    if (messageWindow_) {
-        RECT textRect;
-		// get the position of composition area from TSF
-		if (inputRect(session, &textRect)) {
-			messageWindow_->move(textRect.left, textRect.bottom);
-		}
-    }
+	moveMessageWindowToInputRect(session);
+}
+
+bool TextService::moveMessageWindowToInputRect(Ime::EditSession* session) {
+	if (!messageWindow_) {
+		return false;
+	}
+	RECT textRect{};
+	if (!inputRect(session, &textRect)) {
+		return false;
+	}
+
+	int windowWidth = 0;
+	int windowHeight = 0;
+	messageWindow_->size(&windowWidth, &windowHeight);
+	RECT probeRect{textRect.left, textRect.top,
+		textRect.left + (std::max)(1, windowWidth),
+		textRect.top + (std::max)(1, windowHeight)};
+	HMONITOR monitor = ::MonitorFromRect(&probeRect, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO monitorInfo{};
+	monitorInfo.cbSize = sizeof(monitorInfo);
+	RECT workArea{};
+	if (monitor && ::GetMonitorInfoW(monitor, &monitorInfo)) {
+		workArea = monitorInfo.rcWork;
+	}
+	else {
+		workArea = RECT{0, 0, ::GetSystemMetrics(SM_CXSCREEN), ::GetSystemMetrics(SM_CYSCREEN)};
+	}
+
+	HDC screen = ::GetDC(nullptr);
+	const int dpi = screen ? ::GetDeviceCaps(screen, LOGPIXELSX) : 96;
+	if (screen) {
+		::ReleaseDC(nullptr, screen);
+	}
+	const int gap = (std::max)(2, ::MulDiv(4, dpi > 0 ? dpi : 96, 96));
+	int x = textRect.left;
+	int y = textRect.bottom + gap;
+
+	// At the end of a line, continuation reads most naturally as quiet inline
+	// ghost text. If text follows the caret, or the right edge is crowded, keep
+	// the familiar IME placement below the caret to avoid covering document text.
+	const bool inlineFits = messageWindow_->ghostStyle() && ghostInlinePreferred_ &&
+		textRect.right + gap + windowWidth <= workArea.right;
+	if (inlineFits) {
+		x = textRect.right + gap;
+		const int lineHeight = (std::max)(0L, textRect.bottom - textRect.top);
+		y = textRect.top + (lineHeight - windowHeight) / 2;
+	}
+	else if (y + windowHeight > workArea.bottom) {
+		y = textRect.top - gap - windowHeight;
+	}
+
+	x = (std::max)(static_cast<int>(workArea.left),
+		(std::min)(x, static_cast<int>(workArea.right) - windowWidth));
+	y = (std::max)(static_cast<int>(workArea.top),
+		(std::min)(y, static_cast<int>(workArea.bottom) - windowHeight));
+	messageWindow_->move(x, y);
+	return true;
 }
 
 void TextService::hideMessage() {

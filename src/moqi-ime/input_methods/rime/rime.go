@@ -228,6 +228,9 @@ type IME struct {
 	ghostConfig                  aiCompletionConfig
 	ghostGenerator               func(aiCompletionRequest, aiCompletionConfig) ([]string, error)
 	ghostTimer                   *time.Timer
+	ghostLoadingTimer            *time.Timer
+	ghostLoadingDelay            time.Duration
+	ghostLoadingVisible          bool
 	ghostRequestSeq              uint64
 	ghostPending                 bool
 	ghostReady                   bool

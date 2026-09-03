@@ -134,6 +134,9 @@ func TestGhostCompletionPreservedF8GeneratesFromFreshSurroundingText(t *testing.
 	if resp.ReturnValue != 1 {
 		t.Fatalf("expected on-demand F8 to be consumed, got %#v", resp)
 	}
+	if resp.ShowMessage != nil {
+		t.Fatalf("on-demand F8 must stay visually quiet during the first second, got %#v", resp.ShowMessage)
+	}
 
 	select {
 	case input := <-generated:
@@ -169,6 +172,9 @@ func TestGhostCompletionOrdinaryF8GeneratesFromFreshSurroundingText(t *testing.T
 	if !ime.handleGhostKeyDown(f8, resp) || resp.ReturnValue != 1 {
 		t.Fatalf("ordinary on-demand F8 must be consumed, got %#v", resp)
 	}
+	if resp.ShowMessage != nil {
+		t.Fatalf("ordinary F8 must not show an eager loading message, got %#v", resp.ShowMessage)
+	}
 
 	select {
 	case input := <-generated:
@@ -177,6 +183,97 @@ func TestGhostCompletionOrdinaryF8GeneratesFromFreshSurroundingText(t *testing.T
 		}
 	case <-time.After(time.Second):
 		t.Fatal("ordinary on-demand F8 did not start completion")
+	}
+}
+
+func TestGhostCompletionFastResultSuppressesDelayedLoadingMessage(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.ghostEnabled = true
+	ime.ghostLoadingDelay = 40 * time.Millisecond
+	ime.ghostConfig = aiCompletionConfig{ContextTokens: 128, CandidateCount: 1}
+	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+		return []string{"，正好可以开始工作了。"}, nil
+	}
+	updates := make(chan *imecore.Response, 2)
+	ime.asyncResponseSender = func(resp *imecore.Response) { updates <- resp }
+	t.Cleanup(ime.resetGhostCompletion)
+
+	resp := ime.HandleRequest(&imecore.Request{
+		Method:             "onPreservedKey",
+		SeqNum:             1,
+		Data:               map[string]interface{}{"guid": ghostPreservedKeyGUID},
+		CloudClipboardText: ghostContextEnvelope + "现在一切正常了" + "\x1f",
+	})
+	if resp.ShowMessage != nil {
+		t.Fatalf("fast completion must not flash a loading message, got %#v", resp.ShowMessage)
+	}
+
+	select {
+	case update := <-updates:
+		if update.ShowMessage == nil || update.ShowMessage.Message != "，正好可以开始工作了。" {
+			t.Fatalf("expected completion as the first visible update, got %#v", update)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fast completion did not arrive")
+	}
+
+	time.Sleep(2 * ime.ghostLoadingDelay)
+	select {
+	case update := <-updates:
+		t.Fatalf("loading message leaked after a fast completion: %#v", update)
+	default:
+	}
+}
+
+func TestGhostCompletionShowsLoadingOnlyAfterDelay(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.ghostEnabled = true
+	ime.ghostLoadingDelay = 25 * time.Millisecond
+	ime.ghostConfig = aiCompletionConfig{ContextTokens: 128, CandidateCount: 1}
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+		started <- struct{}{}
+		<-release
+		return []string{"，正好可以开始工作了。"}, nil
+	}
+	updates := make(chan *imecore.Response, 3)
+	ime.asyncResponseSender = func(resp *imecore.Response) { updates <- resp }
+	t.Cleanup(ime.resetGhostCompletion)
+
+	resp := ime.HandleRequest(&imecore.Request{
+		Method:             "onPreservedKey",
+		SeqNum:             1,
+		Data:               map[string]interface{}{"guid": ghostPreservedKeyGUID},
+		CloudClipboardText: ghostContextEnvelope + "现在一切正常了" + "\x1f",
+	})
+	if resp.ShowMessage != nil {
+		t.Fatalf("loading must be delayed, got %#v", resp.ShowMessage)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("completion generator did not start")
+	}
+	select {
+	case update := <-updates:
+		if update.ShowMessage == nil || update.ShowMessage.Message != "本地 AI 正在准备…" {
+			t.Fatalf("expected delayed loading state, got %#v", update)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delayed loading message did not appear")
+	}
+
+	release <- struct{}{}
+	select {
+	case update := <-updates:
+		if update.ShowMessage == nil || update.ShowMessage.Message != "，正好可以开始工作了。" {
+			t.Fatalf("expected completion to replace loading state, got %#v", update)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("completion did not replace delayed loading state")
 	}
 }
 

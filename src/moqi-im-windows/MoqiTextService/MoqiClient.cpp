@@ -1129,6 +1129,10 @@ bool Client::onKeyDown(Ime::KeyEvent &keyEvent, Ime::EditSession *session) {
   auto req = createRpcRequest("onKeyDown");
   addKeyEventToRpcRequest(req, keyEvent);
 
+  if (keyEvent.keyCode() == VK_F8 && textService_ != nullptr) {
+    textService_->setGhostInlinePreferred(textAfterCaret(session, 1).empty());
+  }
+
   // TSF does not call OnKeyUp for ordinary keys unless TestKeyUp reports the
   // key as eaten. Capture the text here instead; the backend combines it with
   // the commit produced by this key and starts completion only after a real
@@ -1365,6 +1369,10 @@ bool Client::onPreservedKey(const GUID &guid, Ime::EditSession *session) {
   if (!guidStr.empty()) {
     auto req = createRpcRequest("onPreservedKey");
     req.set_preserved_key_guid(guidStr);
+
+    if (textService_ != nullptr) {
+      textService_->setGhostInlinePreferred(textAfterCaret(session, 1).empty());
+    }
 
     // F8 can be pressed after a mouse caret move or after text was edited by
     // another input method. Send fresh private surrounding text so completion

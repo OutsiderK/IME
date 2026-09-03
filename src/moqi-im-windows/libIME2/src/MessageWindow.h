@@ -38,6 +38,7 @@ public:
     }
     void setText(std::wstring text);
 	void setGhostStyle(bool enabled);
+	void setGhostAppearance(COLORREF textColor, COLORREF backgroundColor, COLORREF borderColor);
 	bool ghostStyle() const { return ghostStyle_; }
 
     TextService* textService() {
@@ -52,6 +53,12 @@ protected:
 private:
     std::wstring text_;
 	bool ghostStyle_;
+	COLORREF ghostTextColor_;
+	COLORREF ghostBackgroundColor_;
+	COLORREF ghostBorderColor_;
+	int ghostPaddingX_;
+	int ghostPaddingY_;
+	int ghostRadius_;
 };
 
 }
