@@ -78,8 +78,15 @@ try {
     # DllRegisterServer writes through merged HKCR. Remove per-user CLSID keys
     # first so the elevated registration is committed to the machine views;
     # deleting them afterwards would reveal the old HKLM path again.
-    & reg.exe delete $clsidKey /f /reg:64 2>$null | Out-Null
-    & reg.exe delete $clsidKey /f /reg:32 2>$null | Out-Null
+    $regExe = Join-Path $env:WINDIR 'System32\reg.exe'
+    foreach ($registryView in @('/reg:64', '/reg:32')) {
+        # Exit code 1 means the override was already absent, which is the
+        # desired idempotent state. Start-Process also prevents its diagnostic
+        # stderr from becoming a terminating PowerShell error.
+        Start-Process -FilePath $regExe -ArgumentList @(
+            'delete', $clsidKey, '/f', $registryView
+        ) -Wait -WindowStyle Hidden
+    }
 
     $regsvr64 = Join-Path $env:WINDIR 'System32\regsvr32.exe'
     $regsvr32 = Join-Path $env:WINDIR 'SysWOW64\regsvr32.exe'
