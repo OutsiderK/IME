@@ -145,6 +145,41 @@ func TestGhostCompletionPreservedF8GeneratesFromFreshSurroundingText(t *testing.
 	}
 }
 
+func TestGhostCompletionOrdinaryF8GeneratesFromFreshSurroundingText(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.ghostEnabled = true
+	ime.ghostConfig = aiCompletionConfig{IdleMS: 450, ContextTokens: 128, CandidateCount: 3}
+	generated := make(chan aiCompletionRequest, 1)
+	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+		generated <- input
+		return []string{"苹果。"}, nil
+	}
+	t.Cleanup(ime.resetGhostCompletion)
+
+	f8 := &imecore.Request{
+		KeyCode:            vkF8,
+		KeyStates:          make(imecore.KeyStates, 256),
+		CloudClipboardText: ghostContextEnvelope + "我今天吃了一个" + "\x1f，然后去散步。",
+	}
+	filterResp := imecore.NewResponse(1, true)
+	if !ime.handleGhostKeyDownFilter(f8, filterResp) || filterResp.ReturnValue != 1 {
+		t.Fatalf("ordinary F8 must be claimed before a candidate exists, got %#v", filterResp)
+	}
+	resp := imecore.NewResponse(2, true)
+	if !ime.handleGhostKeyDown(f8, resp) || resp.ReturnValue != 1 {
+		t.Fatalf("ordinary on-demand F8 must be consumed, got %#v", resp)
+	}
+
+	select {
+	case input := <-generated:
+		if input.Context != "我今天吃了一个" || input.FollowingContext != "，然后去散步。" || input.Long {
+			t.Fatalf("unexpected ordinary F8 context: %#v", input)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ordinary on-demand F8 did not start completion")
+	}
+}
+
 func TestGhostCompletionAcceptPrimesContinuousCompletion(t *testing.T) {
 	ime := newIsolatedTestIME(t)
 	ime.ghostEnabled = true

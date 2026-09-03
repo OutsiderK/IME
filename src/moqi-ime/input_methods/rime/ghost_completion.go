@@ -85,7 +85,10 @@ func (ime *IME) handleGhostKeyDownFilter(req *imecore.Request, resp *imecore.Res
 		resp.ReturnValue = 1
 		return true
 	}
-	if req.KeyCode == ghostActionKeyCode && ime.hasGhostWorkLocked() {
+	// Always claim F8 through the ordinary TSF key sink. OnKeyDown runs inside
+	// a normal edit session and can safely read fresh surrounding text, unlike
+	// the crash-prone preserved-key callback that is disabled above.
+	if req.KeyCode == ghostActionKeyCode {
 		ime.ghostConsumeKeyUpCode = ghostActionKeyCode
 		resp.ReturnValue = 1
 		return true
@@ -131,6 +134,15 @@ func (ime *IME) handleGhostKeyDown(req *imecore.Request, resp *imecore.Response)
 	if req == nil || resp == nil {
 		return false
 	}
+	if req.KeyCode == ghostActionKeyCode {
+		guid := ghostPreservedKeyGUID
+		if req.KeyStates.IsKeyDown(vkShift) {
+			guid = ghostLongPreservedKeyGUID
+		}
+		ordinaryRequest := *req
+		ordinaryRequest.Data = map[string]interface{}{"guid": guid}
+		return ime.handleGhostPreservedKey(&ordinaryRequest, resp)
+	}
 	ime.ghostMu.Lock()
 	defer ime.ghostMu.Unlock()
 	if !ime.ghostEnabled {
@@ -141,9 +153,6 @@ func (ime *IME) handleGhostKeyDown(req *imecore.Request, resp *imecore.Response)
 		resp.ReturnValue = 1
 		ime.ghostHidePending = false
 		return true
-	}
-	if req.KeyCode == ghostActionKeyCode && ime.hasGhostWorkLocked() {
-		return ime.performGhostActionLocked(resp)
 	}
 	if req.KeyCode == ghostNextKeyCode && ime.ghostVisible && ime.ghostReady {
 		if len(ime.ghostCandidates) > 1 {
