@@ -75,6 +75,12 @@ try {
     Copy-Item -LiteralPath $frontend64Source -Destination $frontend64Target -Force
     Copy-Item -LiteralPath $frontend32Source -Destination $frontend32Target -Force
 
+    # DllRegisterServer writes through merged HKCR. Remove per-user CLSID keys
+    # first so the elevated registration is committed to the machine views;
+    # deleting them afterwards would reveal the old HKLM path again.
+    & reg.exe delete $clsidKey /f /reg:64 2>$null | Out-Null
+    & reg.exe delete $clsidKey /f /reg:32 2>$null | Out-Null
+
     $regsvr64 = Join-Path $env:WINDIR 'System32\regsvr32.exe'
     $regsvr32 = Join-Path $env:WINDIR 'SysWOW64\regsvr32.exe'
     $register64 = Start-Process -FilePath $regsvr64 -ArgumentList @(
@@ -89,10 +95,6 @@ try {
     if ($register32.ExitCode -ne 0) {
         throw "32-bit regsvr32 failed with exit code $($register32.ExitCode)"
     }
-
-    # Remove temporary per-user COM overrides from earlier recovery attempts.
-    & reg.exe delete $clsidKey /f /reg:64 2>$null | Out-Null
-    & reg.exe delete $clsidKey /f /reg:32 2>$null | Out-Null
 
     New-Item -Path $runKey -Force | Out-Null
     Set-ItemProperty -LiteralPath $runKey -Name 'Moqi Launcher' -Value ('"' + $launcherTarget + '"')
