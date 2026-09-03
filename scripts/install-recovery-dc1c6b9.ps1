@@ -110,12 +110,15 @@ try {
         Set-ItemProperty -LiteralPath $runKey -Name 'Moqi Local AI' -Value $aiCommand
     }
 
-    Start-Process -FilePath $launcherTarget -WorkingDirectory $installRoot -WindowStyle Hidden
+    # Delegate long-lived processes to the interactive desktop shell. Starting
+    # them as children of this elevated recovery process makes test harnesses
+    # and interrupted consoles terminate them together with the installer.
+    $desktopShell = New-Object -ComObject 'Shell.Application'
+    $desktopShell.ShellExecute($launcherTarget, '', $installRoot, 'open', 0)
     if (Test-Path -LiteralPath $aiStartupScript -PathType Leaf) {
-        Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-            '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-            '-File', ('"' + $aiStartupScript + '"')
-        ) -WindowStyle Hidden
+        $aiArguments = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' +
+            $aiStartupScript + '"'
+        $desktopShell.ShellExecute('powershell.exe', $aiArguments, $installRoot, 'open', 0)
     }
 
     $result.success = $true
