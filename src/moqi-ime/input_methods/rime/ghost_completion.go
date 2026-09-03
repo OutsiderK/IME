@@ -20,15 +20,13 @@ const (
 	ghostLongPreservedKeyGUID = "{018e48c0-a24f-4b72-bacc-57a2d53284b9}"
 	ghostNextPreservedKeyGUID = "{316649a5-9c0b-4708-a43d-7bedc5bde9bb}"
 	ghostContextEnvelope      = "\x1eMOQI_CONTEXT_V1\x1f"
-	tsfModifierShift          = 0x0004
 )
 
 func ghostPreservedKeyInfos() []imecore.PreservedKeyInfo {
-	return []imecore.PreservedKeyInfo{
-		{KeyCode: uint32(ghostActionKeyCode), GUID: ghostPreservedKeyGUID},
-		{KeyCode: uint32(ghostActionKeyCode), Modifiers: tsfModifierShift, GUID: ghostLongPreservedKeyGUID},
-		{KeyCode: uint32(ghostNextKeyCode), GUID: ghostNextPreservedKeyGUID},
-	}
+	// TSF preserved-key callbacks have caused repeatable host-process crashes
+	// in Electron/Chromium applications. Keep removing legacy registrations,
+	// and rely on the ordinary key sink only when the host delivers F8/F9.
+	return nil
 }
 
 func (ime *IME) ghostCompletionEnabled() bool {

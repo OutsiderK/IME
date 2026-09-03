@@ -96,17 +96,6 @@ bool callClientOnKeyUp(Client* client, Ime::KeyEvent& keyEvent, Ime::EditSession
 	}
 }
 
-bool callClientOnPreservedKey(Client* client, const GUID& guid, Ime::EditSession* session, bool& sehCaught) {
-	sehCaught = false;
-	__try {
-		return client->onPreservedKey(guid, session);
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER) {
-		sehCaught = true;
-		return false;
-	}
-}
-
 void appendCandidateWindowLog(const std::wstring& message) {
 	if (!Ime::isTraceLoggingEnabled()) {
 		return;
@@ -604,44 +593,13 @@ bool TextService::onPreservedKey(const GUID& guid) {
 }
 
 STDMETHODIMP TextService::OnPreservedKey(ITfContext* pContext, REFGUID rguid, BOOL* pfEaten) {
-	if (pfEaten == nullptr) {
-		return S_OK;
-	}
-	*pfEaten = FALSE;
-	if (!client_ || pContext == nullptr || isKeyboardDisabled(pContext) || !isKeyboardOpened()) {
-		return S_OK;
-	}
-
-	// TSF invokes preserved keys from the host application's key dispatch
-	// stack. Chromium/WebView hosts are particularly sensitive to entering a
-	// synchronous read/write edit session from that callback: it can re-enter
-	// the host while F8 is still being dispatched. Eat the registered shortcut
-	// immediately, then read context and apply the backend response from an
-	// asynchronous edit session.
-	*pfEaten = TRUE;
-	const GUID preservedGuid = rguid;
-	Ime::ComPtr<TextService> self(this);
-	HRESULT sessionResult = E_FAIL;
-	auto session = Ime::ComPtr<Ime::EditSession>::make(
-		pContext,
-		[self, preservedGuid](Ime::EditSession* session, TfEditCookie cookie) {
-			if (!self->client_) {
-				return;
-			}
-			bool sehCaught = false;
-			callClientOnPreservedKey(self->client_.get(), preservedGuid, session, sehCaught);
-			if (sehCaught) {
-				logDebug(L"[onPreservedKey] SEH caught while handling preserved key");
-				self->closeClient();
-			}
-		}
-	);
-	const HRESULT requestResult = pContext->RequestEditSession(
-		clientId(), session, TF_ES_ASYNC | TF_ES_READWRITE, &sessionResult);
-	if (FAILED(requestResult) || FAILED(sessionResult)) {
-		logDebug(L"[onPreservedKey] RequestEditSession failed requestHr=" +
-			std::to_wstring(static_cast<long>(requestResult)) + L" sessionHr=" +
-			std::to_wstring(static_cast<long>(sessionResult)));
+	// Fail closed. Entering either a synchronous or asynchronous read/write
+	// edit session from TSF's preserved-key callback has produced repeatable
+	// access violations in Chromium/Electron text hosts. Preserved shortcuts
+	// are disabled by the backend; this guard also makes stale registrations
+	// harmless and lets the application receive F8 normally.
+	if (pfEaten != nullptr) {
+		*pfEaten = FALSE;
 	}
 	return S_OK;
 }

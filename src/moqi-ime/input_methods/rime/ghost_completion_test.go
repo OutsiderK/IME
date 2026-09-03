@@ -1,6 +1,7 @@
 package rime
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -77,25 +78,24 @@ func TestGhostCompletionF8ShowsThenAccepts(t *testing.T) {
 	}
 }
 
-func TestGhostCompletionRegistersAndHandlesF8AsPreservedKey(t *testing.T) {
+func TestGhostCompletionDoesNotRegisterUnsafeTsfPreservedKeys(t *testing.T) {
 	ime := newTestIME()
 	ime.ghostEnabled = true
 	ime.ghostReady = true
 	ime.ghostCandidates = []string{"苹果。", "橘子。"}
 
 	activate := ime.HandleRequest(&imecore.Request{Method: "onActivate", SeqNum: 1})
-	if len(activate.AddPreservedKey) != 3 {
-		t.Fatalf("expected three ghost preserved keys, got %#v", activate.AddPreservedKey)
+	if len(activate.AddPreservedKey) != 0 {
+		t.Fatalf("unsafe ghost preserved keys must stay disabled, got %#v", activate.AddPreservedKey)
 	}
-	key := activate.AddPreservedKey[0]
-	if key.KeyCode != uint32(vkF8) || key.Modifiers != 0 || key.GUID != ghostPreservedKeyGUID {
-		t.Fatalf("unexpected ghost preserved key: %#v", key)
+	wantRemoved := []string{
+		ghostPreservedKeyGUID,
+		ghostLongPreservedKeyGUID,
+		ghostNextPreservedKeyGUID,
 	}
-	if activate.AddPreservedKey[1].KeyCode != uint32(vkF8) || activate.AddPreservedKey[1].Modifiers != tsfModifierShift || activate.AddPreservedKey[1].GUID != ghostLongPreservedKeyGUID {
-		t.Fatalf("unexpected long ghost preserved key: %#v", activate.AddPreservedKey[1])
-	}
-	if activate.AddPreservedKey[2].KeyCode != uint32(vkF9) || activate.AddPreservedKey[2].GUID != ghostNextPreservedKeyGUID {
-		t.Fatalf("unexpected next-candidate preserved key: %#v", activate.AddPreservedKey[2])
+	if !reflect.DeepEqual(activate.RemovePreservedKey, wantRemoved) {
+		t.Fatalf("activation must remove all legacy preserved keys: got %#v, want %#v",
+			activate.RemovePreservedKey, wantRemoved)
 	}
 
 	show := ime.HandleRequest(&imecore.Request{

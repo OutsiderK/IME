@@ -29,9 +29,8 @@ constexpr COLORREF kMutedText = RGB(96, 116, 123);
 constexpr COLORREF kSelectedBackground = RGB(227, 237, 240);
 constexpr COLORREF kSelectedText = RGB(20, 42, 56);
 constexpr COLORREF kFocusAccent = RGB(194, 85, 44);
-// One Han glyph plus this quiet-space metric reserves about 3.4 Han glyphs
-// for candidate text at 96 DPI. Thus a three-character candidate still has
-// roughly 0.4 character of breathing room before the next selection label.
+// Legacy quiet-space floor. The final three-character reservation is derived
+// from the measured glyph width below so it remains correct across DPI/font.
 constexpr int kDefaultCandidateSpacing = 34;
 constexpr int kPreviousCandidateFontTimes2 = 29;
 constexpr int kCurrentCandidateFontTimes2 = 32;
@@ -682,9 +681,13 @@ void CandidateWindow::recalculateSize() {
     TEXTMETRICW commentMetrics = {};
     SIZE ideographSize = {};
     ::GetTextExtentPoint32W(hdc, L"书", 1, &ideographSize);
-    // Reserve enough room for three Han characters plus a small visual gap.
-    // A longer candidate consumes this quiet space before moving later slots.
-    reservedCandidateTextWidth_ = static_cast<int>(ideographSize.cx) + candSpacing_;
+    // Reserve 3.4 measured Han glyphs. Unlike a fixed pixel guess, this leaves
+    // about 0.4 character after a three-character candidate at every DPI.
+    // A larger user spacing setting may still extend the reservation.
+    const int threeCharacterComfortWidth = ::MulDiv(ideographSize.cx, 34, 10);
+    reservedCandidateTextWidth_ = (std::max)(
+        threeCharacterComfortWidth,
+        static_cast<int>(ideographSize.cx) + candSpacing_);
     for (int i = 0, n = static_cast<int>(items_.size()); i < n; ++i) {
         SIZE selKeySize = {};
         wchar_t selKey[] = L"?.";
