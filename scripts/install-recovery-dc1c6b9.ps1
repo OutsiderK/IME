@@ -39,6 +39,22 @@ function Assert-RecoveryArtifact {
     }
 }
 
+function Install-RecoveryArtifact {
+    param(
+        [Parameter(Mandatory = $true)][string] $Source,
+        [Parameter(Mandatory = $true)][string] $Destination
+    )
+
+    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+        $sourceHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
+        $destinationHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
+        if ($sourceHash -eq $destinationHash) {
+            return
+        }
+    }
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+}
+
 function Stop-InstalledMoqiRuntime {
     $allowedPaths = @($launcherTarget, $backendTarget)
     foreach ($process in Get-Process -Name 'MoqiLauncher', 'server' -ErrorAction SilentlyContinue) {
@@ -71,9 +87,9 @@ try {
     Stop-InstalledMoqiRuntime
     Start-Sleep -Milliseconds 500
 
-    Copy-Item -LiteralPath $backendSource -Destination $backendTarget -Force
-    Copy-Item -LiteralPath $frontend64Source -Destination $frontend64Target -Force
-    Copy-Item -LiteralPath $frontend32Source -Destination $frontend32Target -Force
+    Install-RecoveryArtifact -Source $backendSource -Destination $backendTarget
+    Install-RecoveryArtifact -Source $frontend64Source -Destination $frontend64Target
+    Install-RecoveryArtifact -Source $frontend32Source -Destination $frontend32Target
 
     # DllRegisterServer writes through merged HKCR. Remove per-user CLSID keys
     # first so the elevated registration is committed to the machine views;
