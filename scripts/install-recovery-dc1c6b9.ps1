@@ -77,13 +77,17 @@ try {
 
     $regsvr64 = Join-Path $env:WINDIR 'System32\regsvr32.exe'
     $regsvr32 = Join-Path $env:WINDIR 'SysWOW64\regsvr32.exe'
-    & $regsvr64 /s $frontend64Target
-    if ($LASTEXITCODE -ne 0) {
-        throw "64-bit regsvr32 failed with exit code $LASTEXITCODE"
+    $register64 = Start-Process -FilePath $regsvr64 -ArgumentList @(
+        '/s', ('"' + $frontend64Target + '"')
+    ) -Wait -PassThru -WindowStyle Hidden
+    if ($register64.ExitCode -ne 0) {
+        throw "64-bit regsvr32 failed with exit code $($register64.ExitCode)"
     }
-    & $regsvr32 /s $frontend32Target
-    if ($LASTEXITCODE -ne 0) {
-        throw "32-bit regsvr32 failed with exit code $LASTEXITCODE"
+    $register32 = Start-Process -FilePath $regsvr32 -ArgumentList @(
+        '/s', ('"' + $frontend32Target + '"')
+    ) -Wait -PassThru -WindowStyle Hidden
+    if ($register32.ExitCode -ne 0) {
+        throw "32-bit regsvr32 failed with exit code $($register32.ExitCode)"
     }
 
     # Remove temporary per-user COM overrides from earlier recovery attempts.
