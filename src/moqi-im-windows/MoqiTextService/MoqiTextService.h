@@ -332,7 +332,7 @@ private:
 	void invalidateCandidateUiCache();
 	bool isCandidateContentApplied(const std::wstring& renderedPreedit) const;
 	void markCandidateContentApplied(const std::wstring& renderedPreedit);
-	bool moveCandidateWindowToInputRect(Ime::EditSession* session, const wchar_t* reason, bool throttleSamePosition);
+	bool moveCandidateWindowToInputRect(Ime::EditSession* session, const wchar_t* reason);
 
 	bool ensureClientForCurrentProfile(const wchar_t* reason);
 	void closeClient();
@@ -356,9 +356,8 @@ private:
 	bool hasAppliedCandidateContent_;
 	bool hasAppliedCandidateCursor_;
 	int appliedCandidateCursor_;
-	bool hasLastCandidateWindowPos_;
-	POINT lastCandidateWindowPos_;
-	ULONGLONG lastCandidateWindowMoveTick_;
+	bool hasCandidateWindowAnchor_;
+	POINT candidateWindowAnchor_;
 	std::unique_ptr<Ime::MessageWindow> messageWindow_;
 	UINT messageTimerId_;
 	HFONT font_;

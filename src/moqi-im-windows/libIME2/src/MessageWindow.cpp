@@ -38,14 +38,14 @@ void MessageWindow::setGhostStyle(bool enabled) {
     LONG_PTR exStyle = ::GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
     if (enabled) {
         exStyle |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
-        margin_ = 1;
+		margin_ = 1;
     }
     else {
         exStyle &= ~(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
     }
     ::SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, exStyle);
     if (enabled) {
-        ::SetLayeredWindowAttributes(hwnd_, RGB(1, 2, 3), 0, LWA_COLORKEY);
+		::SetLayeredWindowAttributes(hwnd_, RGB(1, 2, 3), 0, LWA_COLORKEY);
     }
     recalculateSize();
     ::InvalidateRect(hwnd_, NULL, TRUE);
@@ -106,7 +106,7 @@ void MessageWindow::onPaint(PAINTSTRUCT& ps) {
     if (ghostStyle_) {
         const COLORREF transparentKey = RGB(1, 2, 3);
         ::FillSolidRect(hDC, &rc, transparentKey);
-        SetTextColor(hDC, RGB(128, 128, 128));
+        SetTextColor(hDC, RGB(96, 116, 123));
         SetBkColor(hDC, transparentKey);
     }
     else if(isImmersive()) {

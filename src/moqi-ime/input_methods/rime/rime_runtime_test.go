@@ -15,6 +15,16 @@ import (
 
 func realRimeTestDirs(t *testing.T) (string, string) {
 	t.Helper()
+	if dataDir := strings.TrimSpace(os.Getenv("MOQI_RIME_DATA_DIR")); dataDir != "" {
+		userDir := strings.TrimSpace(os.Getenv("MOQI_RIME_USER_DIR"))
+		if userDir == "" {
+			t.Skip("MOQI_RIME_USER_DIR is required with MOQI_RIME_DATA_DIR")
+		}
+		if err := os.MkdirAll(userDir, 0o700); err != nil {
+			t.Fatalf("create isolated Rime user dir: %v", err)
+		}
+		return dataDir, userDir
+	}
 
 	appData := os.Getenv("MOQI_REAL_APPDATA")
 	if appData == "" {
@@ -129,6 +139,31 @@ func TestRealRimeCanCommitText(t *testing.T) {
 				t.Fatalf("expected converted text commit for %s, got %q", input, commit.Text)
 			}
 		})
+	}
+}
+
+func TestRealRimeFlypyCanCommitText(t *testing.T) {
+	sessionID := newRealRimeSession(t)
+	if !SelectSchema(sessionID, "rime_frost_double_pinyin_flypy") {
+		t.Fatal("SelectSchema(rime_frost_double_pinyin_flypy) failed")
+	}
+	SetOption(sessionID, "ascii_mode", false)
+	ClearComposition(sessionID)
+	for _, key := range "nh" {
+		if !ProcessKey(sessionID, int(key), 0) {
+			t.Fatalf("ProcessKey failed for %q", key)
+		}
+	}
+	menu, ok := GetMenu(sessionID)
+	if !ok || len(menu.Candidates) == 0 {
+		t.Fatalf("expected Flypy candidates for nh, got %#v", menu)
+	}
+	if !ProcessKey(sessionID, int(' '), 0) {
+		t.Fatal("ProcessKey failed for space")
+	}
+	commit, ok := GetCommit(sessionID)
+	if !ok || strings.TrimSpace(commit.Text) == "" || commit.Text == "nh" {
+		t.Fatalf("expected converted Flypy commit, got %#v", commit)
 	}
 }
 

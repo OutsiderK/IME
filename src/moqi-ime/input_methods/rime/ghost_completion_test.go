@@ -8,6 +8,41 @@ import (
 	"github.com/gaboolic/moqi-ime/imecore"
 )
 
+func TestGhostCompletionRejectsRemoteEndpoint(t *testing.T) {
+	ime := newTestIME()
+	ime.productSettings.AIEnabled = true
+	ime.configureGhostCompletion(&aiRuntimeConfig{
+		API: aiAPIConfig{
+			BaseURL: "https://example.test/v1",
+			APIKey:  "unused",
+			Model:   "local-model",
+		},
+		Completion: aiCompletionConfig{Enabled: true},
+	})
+	if ime.ghostCompletionEnabled() {
+		t.Fatal("remote AI endpoint must not be enabled in the personal Windows edition")
+	}
+}
+
+func TestGhostCompletionAcceptsLoopbackEndpoint(t *testing.T) {
+	ime := newTestIME()
+	ime.productSettings.AIEnabled = true
+	ime.configureGhostCompletion(&aiRuntimeConfig{
+		API: aiAPIConfig{
+			BaseURL: "http://127.0.0.1:8080/v1",
+			APIKey:  "local",
+			Model:   "local-model",
+		},
+		Completion: aiCompletionConfig{Enabled: true},
+	})
+	if !ime.ghostCompletionEnabled() {
+		t.Fatal("loopback AI endpoint should be enabled")
+	}
+	if ime.ghostGenerator == nil {
+		t.Fatal("expected a completion generator for loopback AI")
+	}
+}
+
 func TestGhostCompletionF8ShowsThenAccepts(t *testing.T) {
 	ime := newTestIME()
 	ime.ghostEnabled = true

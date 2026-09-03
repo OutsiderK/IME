@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-$modelPath = Join-Path $PSScriptRoot 'models\Qwen3.5-4B-Q4_K_M.gguf'
+$modelPath = Join-Path $env:LOCALAPPDATA 'MoqiAI\models\Qwen3.5-4B-Q4_K_M.gguf'
 $wingetRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
 $serverPath = Get-ChildItem -LiteralPath $wingetRoot -Filter 'llama-server.exe' -Recurse -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -like '*ggml.llamacpp*' } |
@@ -35,4 +35,3 @@ Write-Host 'Press Ctrl+C to stop.'
     --cors-origins 'localhost'
 
 exit $LASTEXITCODE
-

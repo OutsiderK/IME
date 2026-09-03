@@ -32,3 +32,6 @@ Notes:
   - Installer requests Administrator for COM registration.
   - Fixed AppId inside `MoqiTsf.iss` should stay stable so Windows recognizes upgrades.
   - IME CLSID in the ISS must stay in sync with `MoqiTextService`.
+ChineseSimplified.isl is pinned from
+https://github.com/kira-96/Inno-Setup-Chinese-Simplified-Translation
+at commit 1ff90acc4ed4aee82b1cda43253243deee3daed4 (MIT license).

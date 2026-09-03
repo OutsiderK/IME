@@ -2,6 +2,8 @@
 /.cache/
 /build/
 /tools/
+/diagnostics/
+**/.cache/
 
 # Local AI model and runtime data
 /local-ai/models/
@@ -32,4 +34,3 @@ installer/stage/
 Thumbs.db
 Desktop.ini
 *.log
-

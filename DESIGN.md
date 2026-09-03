@@ -679,3 +679,17 @@ For each project append:
 ```
 
 Explicit project decisions MAY override defaults. They MUST NOT violate the decision priority or the central promise: **effortless clarity with unexpected elegance**.
+
+## Project adaptation
+
+- Product: Windows 个人智能拼音输入法。
+- Audience: 需要长期、高频、低干扰中文输入的单用户。
+- Theme: `mist-shore`，随系统高对比度保留语义可读性。
+- Expression level: `functional`；柿橙仅用于当前候选、光标和必要状态。
+- Primary user goal: 在不被设置和增值功能打断的情况下，快速、稳定地完成中文输入。
+- Existing component source: Win32 TSF、GDI 候选窗、Rime 后端和现有 AI ghost completion。
+- Required views: 横排候选窗、AI 提示窗、五项顶层菜单、系统托盘通知。
+- Art intensity exceptions: 无；不使用渐变、卡片叠层、装饰动画或用户皮肤。
+- Product semantics: `progressive compression` 用于菜单与诊断入口；`bounded failure` 用于本地 AI 和词库操作。
+- Typography: `Noto Sans SC` 16 逻辑像素候选（约 14.5 px 可见字面高度）、10 逻辑像素注释；不打包额外字体，避免增大安装包。
+- Verification commands: 见 `ARCHITECTURE.md` 的“验证”。

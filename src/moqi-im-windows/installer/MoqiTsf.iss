@@ -2,7 +2,7 @@
 ; Build: install Inno Setup 6, then run build-installer.ps1 -StageDir <stage root>
 ; AppId / IME CLSID: keep stable across releases (ARP upgrade path).
 
-#define MyAppName "墨奇输入法"
+#define MyAppName "书无墨输入法"
 #define MyAppPublisher "Moqi"
 #define MyAppURL "https://github.com/gaboolic/moqi-im-windows"
 #define MyAppId "{{C7A6A2D5-16C7-4BE4-8F52-E96D6D6A9E42}"
@@ -25,9 +25,14 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
-CloseApplications=yes
+; A TSF DLL is normally loaded by Explorer and most text-hosting applications.
+; Closing all of them is disruptive and fails in silent upgrades. Keep hosts
+; running and let restartreplace atomically finish DLL replacement at reboot.
+CloseApplications=no
 RestartApplications=no
 WizardStyle=modern
+SetupIconFile=..\..\moqi-ime\icons\shu.ico
+UninstallDisplayIcon={app}\moqi-ime\icons\shu.ico
 OutputDir=dist
 OutputBaseFilename=moqi-im-windows-setup
 Compression=lzma2/max
@@ -36,11 +41,12 @@ WizardSizePercent=110,100
 DisableWelcomePage=no
 
 [Languages]
-; Use the vendored translation file so packaging does not depend on local Inno Setup language packs.
-Name: "chinesesimplified"; MessagesFile: ".\Inno-Setup-Chinese-Simplified-Translation\ChineseSimplified.isl"
+; Pinned from kira-96/Inno-Setup-Chinese-Simplified-Translation at
+; 1ff90acc4ed4aee82b1cda43253243deee3daed4 (MIT).
+Name: "chinesesimplified"; MessagesFile: ".\ChineseSimplified.isl"
 
 [Files]
-Source: "{#StageDir}\win32\MoqiIM\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#StageDir}\win32\MoqiIM\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace uninsrestartdelete
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}\Uninstall"; Filename: "{uninstallexe}"
@@ -48,16 +54,6 @@ Name: "{autoprograms}\{#MyAppName}\Logs"; Filename: "{win}\explorer.exe"; Parame
 
 [Run]
 Filename: "{app}\MoqiLauncher.exe"; Flags: nowait; Check: ShouldLaunchLauncher
-
-[Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
-  ValueType: string; ValueName: "MoqiLauncher"; \
-  ValueData: """{app}\MoqiLauncher.exe"""; \
-  Flags: uninsdeletevalue
-
-[InstallDelete]
-Type: filesandordirs; Name: "{app}\moqi-ime"
-Type: filesandordirs; Name: "{app}\x64"
 
 [Code]
 const
@@ -173,7 +169,7 @@ begin
       HelperInstallSucceeded := True;
       if HadExistingInstall then
         SuppressibleMsgBox(
-          '检测到这是一次覆盖安装。若当前会话里仍有旧的 TSF 实例，墨奇可能要在注销或重启 Windows 后才能立即恢复正常输入。',
+          '检测到这是一次覆盖安装。若当前会话里仍有旧的 TSF 实例，书无墨可能要在注销或重启 Windows 后才能立即恢复正常输入。',
           mbInformation, MB_OK, IDOK);
     end
     else if ResultCode = SetupHelperExitRestartRequired then

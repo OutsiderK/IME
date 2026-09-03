@@ -103,6 +103,7 @@ private:
     bool completeConnectionHandshake();
     bool callRpcPipe(HANDLE pipe, const std::string& serializedRequest, std::string& serializedReply, bool* timedOut = nullptr);
     bool readPipeMessageWithTimeout(HANDLE pipe, std::string& message, DWORD timeoutMs, bool* timedOut = nullptr);
+	bool writePipeMessageWithTimeout(HANDLE pipe, const std::string& message, DWORD timeoutMs);
 	bool waitForRpcIdle(int timeoutMs) const;
 	bool readPendingPipeMessage(std::string& serializedReply);
 	void refreshAsyncPollTimer();

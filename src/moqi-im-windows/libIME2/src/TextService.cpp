@@ -1415,9 +1415,15 @@ bool TextService::inputRect(EditSession* session, RECT* rect) const {
         return false;
     }
 
+    // Keep the candidate window anchored to the beginning of the active
+    // composition. The selection normally follows the end of the preedit; using
+    // it merely because its heuristic score is one point higher makes the whole
+    // window slide on every keystroke. Selection remains a compatibility fallback
+    // for hosts that cannot expose a usable composition range.
+    const bool hasUsableCompositionStart =
+        snapshot.hasCompositionStartRect && snapshot.compositionScore >= 0;
     const bool chooseSelection =
-        snapshot.hasSelectionRectValue &&
-        (!snapshot.hasCompositionStartRect || snapshot.selectionScore >= snapshot.compositionScore);
+        !hasUsableCompositionStart && snapshot.hasSelectionRectValue;
     *rect = chooseSelection ? snapshot.selectionRectValue : snapshot.compositionStartRect;
     const bool adjusted = tryAdjustRectWithForegroundCaret(rect);
 
@@ -1462,4 +1468,3 @@ HWND TextService::compositionWindow(EditSession* session) const {
 }
 
 } // namespace Ime
-

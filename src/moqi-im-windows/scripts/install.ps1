@@ -30,6 +30,9 @@
 
 .PARAMETER IssPath
   Optional path to the Inno Setup script (default: RepoRoot\installer\MoqiTsf.iss).
+
+.PARAMETER StageOnly
+  Prepare and validate the complete installer payload without requiring Inno Setup.
 #>
 param(
     [string] $RepoRoot = "",
@@ -37,6 +40,7 @@ param(
     [string] $X64BuildDir = "",
     [string] $MoqiImeSource = "",
     [switch] $SkipMoqiImeCopy,
+    [switch] $StageOnly,
     [string] $StageDir = "",
     [string] $IssPath = ""
 )
@@ -179,6 +183,7 @@ Copy-Item -LiteralPath $backends -Destination (Join-Path $stageWin32Root "backen
 $launcher = Resolve-ArtifactPath -Label "MoqiLauncher.exe" -Candidates @(
     (Join-Path $Win32BuildDir "MoqiLauncher.exe"),
     (Join-Path $Win32BuildDir "Release\MoqiLauncher.exe"),
+	(Join-Path $Win32BuildDir "MoqLauncher\MoqiLauncher.exe"),
     (Join-Path $Win32BuildDir "MoqLauncher\Release\MoqiLauncher.exe")
 )
 Copy-IfExists -Source $launcher -Destination (Join-Path $stageWin32Root "MoqiLauncher.exe")
@@ -186,6 +191,7 @@ Copy-IfExists -Source $launcher -Destination (Join-Path $stageWin32Root "MoqiLau
 $setupHelper = Resolve-ArtifactPath -Label "SetupHelper.exe" -Candidates @(
     (Join-Path $Win32BuildDir "SetupHelper.exe"),
     (Join-Path $Win32BuildDir "Release\SetupHelper.exe"),
+	(Join-Path $Win32BuildDir "SetupHelper\SetupHelper.exe"),
     (Join-Path $Win32BuildDir "SetupHelper\Release\SetupHelper.exe")
 )
 Copy-IfExists -Source $setupHelper -Destination (Join-Path $stageWin32Root "SetupHelper.exe")
@@ -193,6 +199,7 @@ Copy-IfExists -Source $setupHelper -Destination (Join-Path $stageWin32Root "Setu
 $dll32 = Resolve-ArtifactPath -Label "Win32 MoqiTextService.dll" -Candidates @(
     (Join-Path $Win32BuildDir "MoqiTextService.dll"),
     (Join-Path $Win32BuildDir "Release\MoqiTextService.dll"),
+	(Join-Path $Win32BuildDir "MoqiTextService\MoqiTextService.dll"),
     (Join-Path $Win32BuildDir "MoqiTextService\Release\MoqiTextService.dll")
 )
 Copy-IfExists -Source $dll32 -Destination (Join-Path $stageWin32Root "MoqiTextService.dll")
@@ -200,6 +207,7 @@ Copy-IfExists -Source $dll32 -Destination (Join-Path $stageWin32Root "MoqiTextSe
 $dll64 = Resolve-ArtifactPath -Label "x64 MoqiTextService.dll" -Candidates @(
     (Join-Path $X64BuildDir "MoqiTextService.dll"),
     (Join-Path $X64BuildDir "Release\MoqiTextService.dll"),
+	(Join-Path $X64BuildDir "MoqiTextService\MoqiTextService.dll"),
     (Join-Path $X64BuildDir "MoqiTextService\Release\MoqiTextService.dll")
 )
 Copy-IfExists -Source $dll64 -Destination (Join-Path $stageX64Root "MoqiTextService.dll")
@@ -227,6 +235,11 @@ if (-not (Test-Path -LiteralPath $IssPath)) {
 Write-Host "Stage prepared at: $StageDir"
 Write-Host "Win32 payload: $stageWin32Root"
 Write-Host "x64 payload: $stageX64Root"
+
+if ($StageOnly) {
+    Write-Host "Stage-only mode complete; Inno Setup was not invoked."
+    return
+}
 
 & $installerScript -StageDir $StageDir -IssPath $IssPath
 

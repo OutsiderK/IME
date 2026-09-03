@@ -44,8 +44,13 @@ std::wstring currentProcessPath();
 std::wstring processBaseName(const std::wstring& imagePath);
 std::wstring timestampNow();
 std::wstring formatDebugLogLine(const std::wstring& message);
-constexpr wchar_t kDefaultCommentFontFace[] = L"Consolas";
-constexpr ULONGLONG kCandidateWindowMoveThrottleMs = 50;
+constexpr wchar_t kDefaultCandidateFontFace[] = L"Noto Sans SC";
+constexpr wchar_t kDefaultCommentFontFace[] = L"Noto Sans SC";
+// GDI font heights are integral physical pixels. Keeping the design value in
+// Noto Sans SC's visible glyph box is smaller than its logical em. Sixteen
+// logical pixels gives the candidate text the intended 14.5 px optical size.
+constexpr int kCandidateFontLogicalPxTimes2 = 32;
+constexpr int kCommentFontLogicalPx = 10;
 
 bool callClientFilterKeyDown(Client* client, Ime::KeyEvent& keyEvent, bool& sehCaught) {
 	sehCaught = false;
@@ -340,23 +345,23 @@ TextService::TextService(ImeModule* module):
 	hasAppliedCandidateContent_(false),
 	hasAppliedCandidateCursor_(false),
 	appliedCandidateCursor_(0),
-	hasLastCandidateWindowPos_(false),
-	lastCandidateWindowPos_{0, 0},
-	lastCandidateWindowMoveTick_(0),
+	hasCandidateWindowAnchor_(false),
+	candidateWindowAnchor_{0, 0},
 	updateFont_(false),
-	candPerRow_(1),
-	candSpacing_(20),
+	candPerRow_(7),
+	candSpacing_(34),
 	selKeys_(L"1234567890"),
 	candUseCursor_(true),
+	candFontName_(kDefaultCandidateFontFace),
 	candCommentFontName_(kDefaultCommentFontFace),
-	candFontSize_(16),
-	candCommentFontSize_(14),
-	candBackgroundColor_(RGB(255, 255, 255)),
-	candHighlightColor_(RGB(198, 221, 249)),
-	candTextColor_(RGB(0, 0, 0)),
-	candHighlightTextColor_(RGB(0, 0, 0)),
-	candCommentColor_(RGB(0, 0, 0)),
-	candCommentHighlightColor_(RGB(0, 0, 0)),
+	candFontSize_(13),
+	candCommentFontSize_(10),
+	candBackgroundColor_(RGB(252, 253, 251)),
+	candHighlightColor_(RGB(227, 237, 240)),
+	candTextColor_(RGB(20, 42, 56)),
+	candHighlightTextColor_(RGB(20, 42, 56)),
+	candCommentColor_(RGB(96, 116, 123)),
+	candCommentHighlightColor_(RGB(66, 93, 104)),
 	inlinePreedit_(true),
 	autoPairQuotes_(false),
 	suppressNextCompositionTerminatedNotification_(false),
@@ -370,6 +375,7 @@ TextService::TextService(ImeModule* module):
 	GetObject(font_, sizeof(lf), &lf);
 	lf.lfHeight = candFontHeight(); // FIXME: make this configurable
 	lf.lfWeight = FW_NORMAL;
+	wcsncpy_s(lf.lfFaceName, _countof(lf.lfFaceName), candFontName_.c_str(), _TRUNCATE);
 	font_ = CreateFontIndirect(&lf);
 	lf.lfHeight = candCommentFontHeight();
 	const std::wstring& commentFontName =
@@ -606,22 +612,36 @@ STDMETHODIMP TextService::OnPreservedKey(ITfContext* pContext, REFGUID rguid, BO
 		return S_OK;
 	}
 
+	// TSF invokes preserved keys from the host application's key dispatch
+	// stack. Chromium/WebView hosts are particularly sensitive to entering a
+	// synchronous read/write edit session from that callback: it can re-enter
+	// the host while F8 is still being dispatched. Eat the registered shortcut
+	// immediately, then read context and apply the backend response from an
+	// asynchronous edit session.
+	*pfEaten = TRUE;
+	const GUID preservedGuid = rguid;
+	Ime::ComPtr<TextService> self(this);
 	HRESULT sessionResult = E_FAIL;
-	bool sehCaught = false;
 	auto session = Ime::ComPtr<Ime::EditSession>::make(
 		pContext,
-		[&](Ime::EditSession* session, TfEditCookie cookie) {
-			*pfEaten = callClientOnPreservedKey(client_.get(), rguid, session, sehCaught);
+		[self, preservedGuid](Ime::EditSession* session, TfEditCookie cookie) {
+			if (!self->client_) {
+				return;
+			}
+			bool sehCaught = false;
+			callClientOnPreservedKey(self->client_.get(), preservedGuid, session, sehCaught);
+			if (sehCaught) {
+				logDebug(L"[onPreservedKey] SEH caught while handling preserved key");
+				self->closeClient();
+			}
 		}
 	);
-	pContext->RequestEditSession(clientId(), session, TF_ES_SYNC | TF_ES_READWRITE, &sessionResult);
-	if (sehCaught) {
-		logDebug(L"[onPreservedKey] SEH caught while handling preserved key");
-		*pfEaten = FALSE;
-	}
-	if (FAILED(sessionResult)) {
-		logDebug(L"[onPreservedKey] RequestEditSession failed hr=" + std::to_wstring(static_cast<long>(sessionResult)));
-		*pfEaten = onPreservedKey(rguid);
+	const HRESULT requestResult = pContext->RequestEditSession(
+		clientId(), session, TF_ES_ASYNC | TF_ES_READWRITE, &sessionResult);
+	if (FAILED(requestResult) || FAILED(sessionResult)) {
+		logDebug(L"[onPreservedKey] RequestEditSession failed requestHr=" +
+			std::to_wstring(static_cast<long>(requestResult)) + L" sessionHr=" +
+			std::to_wstring(static_cast<long>(sessionResult)));
 	}
 	return S_OK;
 }
@@ -837,7 +857,9 @@ void TextService::createCandidateWindow(Ime::EditSession* session) {
 		else {
 			appendCandidateWindowLog(L"[TextService::createCandidateWindow] elementMgr unavailable");
 		}
-		candidateWindow_->Show(shouldShowCandidateWindowUI_ ? TRUE : FALSE);
+		// Keep a newly created window hidden until updateCandidates() has applied
+		// its first complete content, size, and anchor. Showing it here exposes an
+		// empty/stale frame before every new composition in some Chromium hosts.
 		if (!shouldShowCandidateWindowUI_) {
 			appendCandidateWindowLog(L"[TextService::createCandidateWindow] candidate window suppressed by UI-less host");
 		}
@@ -907,9 +929,9 @@ void TextService::updateCandidates(Ime::EditSession* session) {
 		hasAppliedCandidateCursor_ = false;
 	}
 
-	moveCandidateWindowToInputRect(session, L"updateCandidates", true);
+	moveCandidateWindowToInputRect(session, L"updateCandidates");
 
-	if (showingCandidates_) {
+	if (showingCandidates_ && !candidateWindow_->isVisible() && shouldShowCandidateWindowUI_) {
 		candidateWindow_->Show(shouldShowCandidateWindowUI_ ? TRUE : FALSE);
 		std::wostringstream log;
 		log << L"[TextService::updateCandidates] ensured visibility should_show_ui="
@@ -932,7 +954,7 @@ void TextService::updateCandidatesWindow(Ime::EditSession* session) {
     ensureCandidateWindowValid(L"updateCandidatesWindow");
     if (candidateWindow_) {
         candidateWindow_->syncOwner(session);
-		moveCandidateWindowToInputRect(session, L"updateCandidatesWindow", true);
+		moveCandidateWindowToInputRect(session, L"updateCandidatesWindow");
     }
 }
 
@@ -957,6 +979,11 @@ bool TextService::setCandidateCursor(int cursor) {
 			return false;
 		}
 		candidateWindow_->setCurrentSel(cursor);
+		if (candidateWindow_->isVisible()) {
+			// Paint the new focus cell before the next TSF/RPC callback. This makes
+			// key-repeat feel continuous instead of batching highlights behind input.
+			::UpdateWindow(candidateWindow_->hwnd());
+		}
 		appliedCandidateCursor_ = cursor;
 		hasAppliedCandidateCursor_ = true;
 		return true;
@@ -971,9 +998,8 @@ void TextService::invalidateCandidateUiCache() {
 	hasAppliedCandidateContent_ = false;
 	hasAppliedCandidateCursor_ = false;
 	appliedCandidateCursor_ = 0;
-	hasLastCandidateWindowPos_ = false;
-	lastCandidateWindowPos_ = {0, 0};
-	lastCandidateWindowMoveTick_ = 0;
+	hasCandidateWindowAnchor_ = false;
+	candidateWindowAnchor_ = POINT{0, 0};
 }
 
 bool TextService::isCandidateContentApplied(const std::wstring& renderedPreedit) const {
@@ -990,39 +1016,67 @@ void TextService::markCandidateContentApplied(const std::wstring& renderedPreedi
 	hasAppliedCandidateContent_ = true;
 }
 
-bool TextService::moveCandidateWindowToInputRect(Ime::EditSession* session, const wchar_t* reason, bool throttleSamePosition) {
+bool TextService::moveCandidateWindowToInputRect(Ime::EditSession* session, const wchar_t* reason) {
 	if (!candidateWindow_) {
 		return false;
 	}
-
-	RECT textRect;
-	// get the position of composition area from TSF
-	if (!inputRect(session, &textRect)) {
-		std::wstring tag = L"[TextService::";
-		tag += reason;
-		tag += L"] inputRect unavailable";
-		appendCandidateWindowLog(tag);
-		return false;
+	// Keep the document anchor stable for the lifetime of one composition.
+	// Some Chromium/Electron hosts report a moving selection rectangle while
+	// inline preedit grows; following it makes the entire candidate row jitter.
+	if (!hasCandidateWindowAnchor_) {
+		RECT textRect;
+		if (!inputRect(session, &textRect)) {
+			std::wstring tag = L"[TextService::";
+			tag += reason;
+			tag += L"] inputRect unavailable";
+			appendCandidateWindowLog(tag);
+			return false;
+		}
+		candidateWindowAnchor_ = POINT{textRect.left, textRect.bottom};
+		hasCandidateWindowAnchor_ = true;
 	}
 
-	const POINT nextPos{textRect.left, textRect.bottom};
-	const ULONGLONG now = ::GetTickCount64();
-	if (throttleSamePosition && hasLastCandidateWindowPos_ &&
-		lastCandidateWindowPos_.x == nextPos.x &&
-		lastCandidateWindowPos_.y == nextPos.y &&
-		now - lastCandidateWindowMoveTick_ < kCandidateWindowMoveThrottleMs) {
-		return false;
+	int windowWidth = 0;
+	int windowHeight = 0;
+	candidateWindow_->size(&windowWidth, &windowHeight);
+	RECT probeRect{
+		candidateWindowAnchor_.x,
+		candidateWindowAnchor_.y,
+		candidateWindowAnchor_.x + (std::max)(1, windowWidth),
+		candidateWindowAnchor_.y + (std::max)(1, windowHeight)};
+	HMONITOR monitor = ::MonitorFromRect(&probeRect, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO monitorInfo{};
+	monitorInfo.cbSize = sizeof(monitorInfo);
+	RECT workArea{};
+	if (monitor && ::GetMonitorInfoW(monitor, &monitorInfo)) {
+		workArea = monitorInfo.rcWork;
+	} else {
+		workArea = RECT{0, 0, ::GetSystemMetrics(SM_CXSCREEN), ::GetSystemMetrics(SM_CYSCREEN)};
 	}
+	const int workWidth = (std::max)(1L, workArea.right - workArea.left);
+	candidateWindow_->setMaximumWidth(workWidth);
+	candidateWindow_->size(&windowWidth, &windowHeight);
 
-	// FIXME: where should we put the candidate window?
+	// Preserve the original left edge until the right edge would cross the
+	// monitor. Only then grow leftward, matching the stable geometry of the
+	// Microsoft IME candidate row. Also keep the window vertically visible.
+	POINT nextPos = candidateWindowAnchor_;
+	const int maxLeft = workArea.right - windowWidth;
+	nextPos.x = (std::max)(workArea.left, (std::min)(nextPos.x, static_cast<LONG>(maxLeft)));
+	if (nextPos.y + windowHeight > workArea.bottom) {
+		nextPos.y = candidateWindowAnchor_.y - windowHeight;
+	}
+	nextPos.y = (std::max)(workArea.top, (std::min)(
+		nextPos.y, static_cast<LONG>(workArea.bottom - windowHeight)));
 	candidateWindow_->move(nextPos.x, nextPos.y);
-	hasLastCandidateWindowPos_ = true;
-	lastCandidateWindowPos_ = nextPos;
-	lastCandidateWindowMoveTick_ = now;
 
 	std::wostringstream log;
-	log << L"[TextService::" << reason << L"] moved left=" << nextPos.x
-		<< L" bottom=" << nextPos.y;
+	log << L"[TextService::" << reason << L"] anchor=("
+		<< candidateWindowAnchor_.x << L"," << candidateWindowAnchor_.y
+		<< L") placed=(" << nextPos.x << L"," << nextPos.y << L") size=("
+		<< windowWidth << L"," << windowHeight << L") work=("
+		<< workArea.left << L"," << workArea.top << L"," << workArea.right
+		<< L"," << workArea.bottom << L")";
 	appendCandidateWindowLog(log.str());
 	return true;
 }
@@ -1043,10 +1097,13 @@ void TextService::showCandidates(Ime::EditSession* session) {
 	// if we're in a Windows store app. If isImmersive() returns true,
 	// The candidate window created should be a child window of the composition window.
 	// Please see Ime::CandidateWindow::CandidateWindow() for an example.
+	const bool startingCandidateSession = !showingCandidates_;
 	createCandidateWindow(session);
 	if (candidateWindow_) {
 		candidateWindow_->syncOwner(session);
-		candidateWindow_->Show(shouldShowCandidateWindowUI_ ? TRUE : FALSE);
+		if (startingCandidateSession) {
+			candidateWindow_->beginStableLayout();
+		}
 	}
 	showingCandidates_ = true;
 	pendingCandidateRecovery_ = false;
@@ -1062,6 +1119,7 @@ void TextService::hideCandidates(bool preserveRecoveryState) {
 		return;
 	}
 	if (ensureCandidateWindowValid(L"hideCandidates")) {
+		candidateWindow_->endStableLayout();
 		candidateWindow_->setPreeditText(L"");
 		candidateWindow_->Show(FALSE);
 		candidateWindow_->clear();
@@ -1094,8 +1152,8 @@ void TextService::showMessage(Ime::EditSession* session, std::wstring message, i
 	int x = 0, y = 0;
 	RECT rc;
 	if(inputRect(session, &rc)) {
-		x = isGhost ? rc.right : rc.left;
-		y = isGhost ? rc.top : rc.bottom;
+		x = rc.left;
+		y = rc.bottom;
 	}
 	messageWindow_->move(x, y);
 	messageWindow_->show();
@@ -1108,14 +1166,9 @@ void TextService::showMessage(Ime::EditSession* session, std::wstring message, i
 void TextService::updateMessageWindow(Ime::EditSession* session) {
     if (messageWindow_) {
         RECT textRect;
-        // get the position of composition area from TSF
+		// get the position of composition area from TSF
 		if (inputRect(session, &textRect)) {
-			if (messageWindow_->ghostStyle()) {
-				messageWindow_->move(textRect.right, textRect.top);
-			}
-			else {
-				messageWindow_->move(textRect.left, textRect.bottom);
-			}
+			messageWindow_->move(textRect.left, textRect.bottom);
 		}
     }
 }
@@ -1150,25 +1203,27 @@ void TextService::updateLangButtons() {
 }
 
 int TextService::candFontHeight() {
-	int candFontHeight_ = -candFontSize_;
+	int fontHeight = -(kCandidateFontLogicalPxTimes2 + 1) / 2;
 	HDC hdc = GetDC(NULL);
 	if (hdc)
 	{
-		candFontHeight_ = -MulDiv(candFontSize_, GetDeviceCaps(hdc, LOGPIXELSY), 72);
+		fontHeight = -(std::max)(1, MulDiv(
+			kCandidateFontLogicalPxTimes2, GetDeviceCaps(hdc, LOGPIXELSY), 96 * 2));
 		ReleaseDC(NULL, hdc);
 	}
-	return candFontHeight_;
+	return fontHeight;
 }
 
 int TextService::candCommentFontHeight() {
-	int candFontHeight_ = -candCommentFontSize_;
+	int fontHeight = -kCommentFontLogicalPx;
 	HDC hdc = GetDC(NULL);
 	if (hdc)
 	{
-		candFontHeight_ = -MulDiv(candCommentFontSize_, GetDeviceCaps(hdc, LOGPIXELSY), 72);
+		fontHeight = -(std::max)(1, MulDiv(
+			kCommentFontLogicalPx, GetDeviceCaps(hdc, LOGPIXELSY), 96));
 		ReleaseDC(NULL, hdc);
 	}
-	return candFontHeight_;
+	return fontHeight;
 }
 
 void TextService::applyCandidateAppearanceNow() {

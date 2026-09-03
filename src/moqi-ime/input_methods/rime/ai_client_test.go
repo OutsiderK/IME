@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -217,14 +218,15 @@ func TestGenerateInlineCompletionsUsesFewShotAndLocalRepeatControls(t *testing.T
 	if err != nil || len(candidates) != 3 {
 		t.Fatalf("unexpected inline result candidates=%#v err=%v", candidates, err)
 	}
-	if len(captured.Messages) != 6 || captured.Messages[2].Role != "assistant" || captured.Messages[4].Role != "assistant" {
+	if len(captured.Messages) < 6 || captured.Messages[2].Role != "assistant" || captured.Messages[4].Role != "assistant" {
 		t.Fatalf("expected a ChatML few-shot exchange, got %#v", captured.Messages)
 	}
 	if captured.RepeatPenalty == 0 || captured.DryMultiplier == 0 || captured.TopP == 0 {
 		t.Fatalf("expected local anti-repeat sampling controls, got %#v", captured)
 	}
-	if !strings.Contains(captured.Messages[5].Content, "具体有番茄、") {
-		t.Fatalf("expected actual context in final user turn, got %q", captured.Messages[5].Content)
+	lastMessage := captured.Messages[len(captured.Messages)-1]
+	if !strings.Contains(lastMessage.Content, "具体有番茄、") {
+		t.Fatalf("expected actual context in final user turn, got %q", lastMessage.Content)
 	}
 }
 
@@ -332,9 +334,9 @@ func TestBuildAIUserPromptAppendsIMContextWithoutPlaceholders(t *testing.T) {
 }
 
 func TestGenerateReviewCandidatesWithRealAPI(t *testing.T) {
-	// if os.Getenv("MOQI_AI_REAL_TEST") != "1" {
-	// 	t.Skip("set MOQI_AI_REAL_TEST=1 to run real API test")
-	// }
+	if os.Getenv("MOQI_AI_REAL_TEST") != "1" {
+		t.Skip("set MOQI_AI_REAL_TEST=1 to run real API test")
+	}
 
 	client := newAIClientFromEnv()
 	if client == nil {

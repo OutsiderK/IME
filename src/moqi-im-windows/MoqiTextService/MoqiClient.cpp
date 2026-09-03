@@ -30,8 +30,6 @@
 #include <Shellapi.h>
 #include <VersionHelpers.h> // Provided by Windows SDK >= 8.1
 #include <Winnls.h> // for IS_HIGH_SURROGATE() macro for checking UTF16 surrogate pairs
-#include <mmsystem.h> // for timeBeginPeriod/timeEndPeriod (timer resolution during RPC waits)
-#pragma comment(lib, "winmm.lib")
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -52,12 +50,6 @@ namespace Moqi {
 static constexpr UINT ASYNC_RPC_POLL_INTERVAL_MS = 50;
 static constexpr int FIRST_PRINTABLE_KEY_RPC_WAIT_MS = 200;
 static constexpr DWORD RPC_BUSY_POLL_INTERVAL_MS = 5;
-// Poll interval while waiting for a pipe reply. Must stay small (1-2ms): the
-// reply normally arrives within a few ms, and a large Sleep() would add up to
-// that delay to every keystroke (the old 50ms poll made typing feel very
-// laggy). timeBeginPeriod(1) inside the wait keeps this a real ~2ms instead of
-// the default ~15.6ms system tick.
-static constexpr DWORD RPC_REPLY_POLL_INTERVAL_MS = 2;
 
 // Bounded waits so a not-yet-started or hung MoqiLauncher/backend can never
 // block the TSF thread indefinitely:
@@ -1613,27 +1605,7 @@ bool Client::readPendingPipeMessage(std::string &serializedReply) {
     return false;
   }
 
-  char buf[1024];
-  DWORD rlen = 0;
-  bool hasMoreData = false;
-  if (!::ReadFile(pipe_, buf, sizeof(buf), &rlen, nullptr)) {
-    if (::GetLastError() == ERROR_MORE_DATA) {
-      hasMoreData = true;
-    } else {
-      return false;
-    }
-  }
-  serializedReply.append(buf, rlen);
-
-  while (hasMoreData) {
-    if (::ReadFile(pipe_, buf, sizeof(buf), &rlen, nullptr)) {
-      hasMoreData = false;
-    } else if (::GetLastError() != ERROR_MORE_DATA) {
-      return false;
-    }
-    serializedReply.append(buf, rlen);
-  }
-  return true;
+  return readPipeMessageWithTimeout(pipe_, serializedReply, 0, nullptr);
 }
 
 void Client::enqueueAsyncResponse(const moqi::protocol::ServerResponse &response) {
@@ -1729,71 +1701,74 @@ bool Client::readPipeMessageWithTimeout(HANDLE pipe, std::string &message,
     return false;
   }
   const ULONGLONG deadline = ::GetTickCount64() + timeoutMs;
-
-  // Raise the timer resolution for the duration of the wait. PeekNamedPipe +
-  // Sleep() polling is how the reply is discovered, and with the default
-  // ~15.6ms system tick a reply that arrives a few ms after the poll would not
-  // be noticed for up to ~50ms -- once per RPC, and each keystroke issues
-  // several RPCs, which made typing feel very laggy. timeBeginPeriod is
-  // ref-counted by the OS and released as soon as the reply arrives, so the
-  // impact on the rest of the system is limited to the wait itself.
-  const MMRESULT timerResult = ::timeBeginPeriod(1);
-  const bool timerPeriodActive = timerResult == TIMERR_NOERROR;
-
   char buf[1024];
   while (true) {
-    DWORD bytesAvailable = 0;
-    if (!::PeekNamedPipe(pipe, nullptr, 0, nullptr, &bytesAvailable, nullptr)) {
-      if (timerPeriodActive) {
-        ::timeEndPeriod(1);
-      }
+    OVERLAPPED overlapped = {};
+    overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!overlapped.hEvent) {
       return false;
     }
-    if (bytesAvailable > 0) {
-      DWORD rlen = 0;
-      bool hasMoreData = false;
-      if (!::ReadFile(pipe, buf, sizeof(buf), &rlen, nullptr)) {
-        if (::GetLastError() == ERROR_MORE_DATA) {
-          hasMoreData = true;
-        } else { // unknown error
-          if (timerPeriodActive) {
-            ::timeEndPeriod(1);
-          }
-          return false;
-        }
-      }
-      message.append(buf, rlen);
 
-      while (hasMoreData) {
-        if (::ReadFile(pipe, buf, sizeof(buf), &rlen, nullptr)) {
-          hasMoreData = false;
-        } else if (::GetLastError() != ERROR_MORE_DATA) { // unknown error
-          if (timerPeriodActive) {
-            ::timeEndPeriod(1);
-          }
-          return false;
+    DWORD bytesRead = 0;
+    bool moreData = false;
+    BOOL completed = ::ReadFile(pipe, buf, sizeof(buf), &bytesRead, &overlapped);
+    DWORD error = completed ? ERROR_SUCCESS : ::GetLastError();
+    if (!completed && error == ERROR_IO_PENDING) {
+      const ULONGLONG now = ::GetTickCount64();
+      const DWORD remaining = now >= deadline ? 0 : static_cast<DWORD>(deadline - now);
+      const DWORD waitResult = ::WaitForSingleObject(overlapped.hEvent, remaining);
+      if (waitResult != WAIT_OBJECT_0) {
+        ::CancelIoEx(pipe, &overlapped);
+        ::WaitForSingleObject(overlapped.hEvent, INFINITE);
+        ::CloseHandle(overlapped.hEvent);
+        if (timedOut != nullptr && waitResult == WAIT_TIMEOUT) {
+          *timedOut = true;
         }
-        message.append(buf, rlen);
+        return false;
       }
-      if (timerPeriodActive) {
-        ::timeEndPeriod(1);
-      }
+      completed = ::GetOverlappedResult(pipe, &overlapped, &bytesRead, FALSE);
+      error = completed ? ERROR_SUCCESS : ::GetLastError();
+    }
+    ::CloseHandle(overlapped.hEvent);
+
+    if (!completed && error != ERROR_MORE_DATA) {
+      return false;
+    }
+    moreData = error == ERROR_MORE_DATA;
+    message.append(buf, bytesRead);
+    if (!moreData) {
       return true;
     }
-    const ULONGLONG now = ::GetTickCount64();
-    if (now >= deadline) {
-      if (timedOut != nullptr) {
-        *timedOut = true;
-      }
-      if (timerPeriodActive) {
-        ::timeEndPeriod(1);
-      }
-      return false; // timed out waiting for the reply
-    }
-    ::Sleep(static_cast<DWORD>(
-        (std::min)(static_cast<ULONGLONG>(RPC_REPLY_POLL_INTERVAL_MS),
-                   deadline - now)));
   }
+}
+
+bool Client::writePipeMessageWithTimeout(HANDLE pipe, const std::string &message,
+                                         DWORD timeoutMs) {
+  if (pipe == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  OVERLAPPED overlapped = {};
+  overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!overlapped.hEvent) {
+    return false;
+  }
+  DWORD written = 0;
+  BOOL completed = ::WriteFile(pipe, message.data(),
+                               static_cast<DWORD>(message.size()), &written,
+                               &overlapped);
+  DWORD error = completed ? ERROR_SUCCESS : ::GetLastError();
+  if (!completed && error == ERROR_IO_PENDING) {
+    const DWORD waitResult = ::WaitForSingleObject(overlapped.hEvent, timeoutMs);
+    if (waitResult == WAIT_OBJECT_0) {
+      completed = ::GetOverlappedResult(pipe, &overlapped, &written, FALSE);
+    } else {
+      ::CancelIoEx(pipe, &overlapped);
+      ::WaitForSingleObject(overlapped.hEvent, INFINITE);
+      completed = FALSE;
+    }
+  }
+  ::CloseHandle(overlapped.hEvent);
+  return completed && written == message.size();
 }
 
 bool Client::callRpcPipe(HANDLE pipe, const std::string &serializedRequest,
@@ -1804,11 +1779,8 @@ bool Client::callRpcPipe(HANDLE pipe, const std::string &serializedRequest,
   // Write the request as one pipe message, then wait for the reply with a
   // bounded deadline (WriteFile + ReadFile instead of the unbounded
   // TransactNamedPipe).
-  DWORD written = 0;
-  if (!::WriteFile(pipe, serializedRequest.data(),
-                   static_cast<DWORD>(serializedRequest.size()), &written,
-                   nullptr) ||
-      written != serializedRequest.size()) {
+  if (!writePipeMessageWithTimeout(pipe, serializedRequest,
+                                   RPC_ASYNC_REPLY_WAIT_MS)) {
     return false;
   }
   return readPipeMessageWithTimeout(pipe, serializedReply,
@@ -1914,7 +1886,7 @@ HANDLE Client::connectPipe(const wchar_t *pipeName, int timeoutMs) {
   HANDLE pipe = INVALID_HANDLE_VALUE;
   if (WaitNamedPipe(pipeName, timeoutMs)) {
     pipe = CreateFile(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL,
-                      OPEN_EXISTING, 0, NULL);
+                      OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
   }
 
   if (pipe != INVALID_HANDLE_VALUE) {
@@ -1972,9 +1944,7 @@ void Client::sendRpcNoWait(const char *methodName) {
   if (!Proto::serializeMessage(req, serializedRequest)) {
     return;
   }
-  DWORD written = 0;
-  ::WriteFile(pipe_, serializedRequest.data(),
-              static_cast<DWORD>(serializedRequest.size()), &written, nullptr);
+  writePipeMessageWithTimeout(pipe_, serializedRequest, 200);
 }
 
 bool Client::ensureLauncherRunning() {
@@ -2006,8 +1976,32 @@ bool Client::ensureLauncherRunning() {
     return false;
   }
 
-  // Use CreateProcessW instead of ShellExecuteW: it cannot fail on the secure
-  // desktop / early logon and we control the working directory explicitly.
+  // Hand the launch to the already-running desktop Explorer. A TSF can be
+  // loaded by a packaged application with a restricted token; directly
+  // creating the broker from there makes the user's model directory appear
+  // missing. Explorer dispatches the executable in the interactive desktop
+  // user's context. SYSTEM hosts were rejected above, so this is never used on
+  // the secure desktop. Keep direct CreateProcessW as a bounded fallback when
+  // the desktop shell is temporarily unavailable.
+  wchar_t windowsDir[MAX_PATH] = {};
+  if (::GetWindowsDirectoryW(windowsDir, _countof(windowsDir)) > 0) {
+    const std::wstring explorerPath =
+        std::wstring(windowsDir) + L"\\explorer.exe";
+    std::wstring shellCommandLine =
+        L"\"" + explorerPath + L"\" \"" + launcherPath + L"\"";
+    STARTUPINFOW shellStartupInfo = {};
+    shellStartupInfo.cb = sizeof(shellStartupInfo);
+    PROCESS_INFORMATION shellProcessInfo = {};
+    if (::CreateProcessW(explorerPath.c_str(), shellCommandLine.data(), nullptr,
+                         nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                         module->programDir().c_str(), &shellStartupInfo,
+                         &shellProcessInfo)) {
+      ::CloseHandle(shellProcessInfo.hThread);
+      ::CloseHandle(shellProcessInfo.hProcess);
+      return true;
+    }
+  }
+
   std::wstring commandLine = L"\"" + launcherPath + L"\"";
   STARTUPINFOW startupInfo = {};
   startupInfo.cb = sizeof(startupInfo);

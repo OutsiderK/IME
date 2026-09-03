@@ -1,8 +1,13 @@
+param(
+    [string] $ModelRoot = (Join-Path $env:LOCALAPPDATA 'MoqiAI\models')
+)
+
 $ErrorActionPreference = 'Stop'
 
 $healthUrl = 'http://127.0.0.1:8080/health'
-$modelPath = Join-Path $PSScriptRoot 'models\Qwen3.5-4B-Q4_K_M.gguf'
-$logDir = Join-Path $PSScriptRoot 'logs'
+$modelPath = Join-Path $ModelRoot 'Qwen3.5-4B-Q4_K_M.gguf'
+$runtimeRoot = Split-Path -Parent $ModelRoot
+$logDir = Join-Path $runtimeRoot 'logs'
 $wingetRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
 
 function Test-LocalAI {
@@ -16,6 +21,7 @@ function Test-LocalAI {
 }
 
 if (Test-LocalAI) {
+    Write-Output '0'
     exit 0
 }
 
@@ -48,18 +54,20 @@ $serverArgs = @(
     '--cors-origins', 'localhost'
 )
 
-Start-Process -FilePath $serverPath `
+$process = Start-Process -FilePath $serverPath `
     -ArgumentList $serverArgs `
     -WindowStyle Hidden `
     -RedirectStandardOutput (Join-Path $logDir 'llama-server.stdout.log') `
-    -RedirectStandardError (Join-Path $logDir 'llama-server.stderr.log')
+    -RedirectStandardError (Join-Path $logDir 'llama-server.stderr.log') `
+    -PassThru
 
 for ($attempt = 0; $attempt -lt 40; $attempt++) {
     if (Test-LocalAI) {
+        Write-Output $process.Id
         exit 0
     }
     Start-Sleep -Milliseconds 500
 }
 
+Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
 throw 'Local AI did not become healthy within 20 seconds.'
-

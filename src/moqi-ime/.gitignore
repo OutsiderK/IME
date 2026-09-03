@@ -37,3 +37,4 @@ go.work.sum
 
 scripts/build
 input_methods/rime/data
+rime-frost/

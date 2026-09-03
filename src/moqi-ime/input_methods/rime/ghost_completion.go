@@ -43,17 +43,29 @@ func (ime *IME) configureGhostCompletion(cfg *aiRuntimeConfig) {
 	ime.resetGhostCompletionLocked()
 	ime.ghostEnabled = false
 	ime.ghostGenerator = nil
-	if cfg == nil || !cfg.Completion.Enabled {
+	if cfg == nil || !cfg.Completion.Enabled || !ime.productSettings.AIEnabled {
 		return
 	}
 	client := newAIClient(cfg)
-	if client == nil {
+	if client == nil || !isLoopbackAIEndpoint(client.baseURL) {
+		debugLogf("本地 AI 已禁用：接口必须是 127.0.0.1、localhost 或 ::1")
 		return
 	}
 	ime.ghostConfig = cfg.Completion
-	ime.ghostGenerator = client.GenerateInlineCompletions
+	ime.ghostGenerator = managedCompletionGenerator(
+		client,
+		ime.productSettings.AIRunMode,
+		ime.productSettings.AIIdleExitMinutes,
+	)
 	ime.ghostEnabled = true
 	debugLogf("Ghost completion configured idle_ms=%d context_tokens=%d candidates=%d", ime.ghostConfig.IdleMS, ime.ghostConfig.ContextTokens, ime.ghostConfig.CandidateCount)
+	if ime.productSettings.AIRunMode == aiRunModeResident {
+		go func() {
+			if err := sharedLocalAIRuntime.ensure(client, aiRunModeResident, 0); err != nil {
+				debugLogf("Local AI resident warmup skipped: %v", err)
+			}
+		}()
+	}
 }
 
 func (ime *IME) handleGhostKeyDownFilter(req *imecore.Request, resp *imecore.Response) bool {
@@ -219,6 +231,7 @@ func (ime *IME) handleGhostPreservedKey(req *imecore.Request, resp *imecore.Resp
 		// F8 is also an on-demand trigger. This makes completion available after
 		// mouse caret moves and in text that was not entered through Moqi.
 		ime.scheduleGhostCompletionForSurrounding(before, following, true, 0, longMode)
+		resp.ShowMessage = &imecore.MessageWindow{Message: "本地 AI 正在准备…", Duration: ghostMessageDuration}
 		if hadVisible {
 			resp.HideMessage = true
 		}
@@ -313,6 +326,9 @@ func (ime *IME) scheduleGhostCompletionWithContext(req *imecore.Request, rawCont
 	if req == nil || !isGhostContextKey(req) {
 		return
 	}
+	if ime.productSettings.AIRunMode == aiRunModeManual {
+		return
+	}
 	ime.scheduleGhostCompletionForSurrounding(rawContext, rawFollowing, false,
 		time.Duration(ime.ghostConfig.IdleMS)*time.Millisecond, false)
 }
@@ -398,6 +414,13 @@ func (ime *IME) startGhostCompletion(requestSeq uint64, context, following strin
 				ime.fillGhostResponseLocked(updateResp)
 			}
 		} else {
+			if ime.ghostRevealRequested {
+				updateResp = imecore.NewResponse(0, true)
+				updateResp.ShowMessage = &imecore.MessageWindow{
+					Message:  friendlyGhostError(err),
+					Duration: 3,
+				}
+			}
 			ime.resetGhostCompletionLocked()
 		}
 	}
@@ -405,6 +428,25 @@ func (ime *IME) startGhostCompletion(requestSeq uint64, context, following strin
 	debugLogf("Ghost completion finished seq=%d elapsed=%s candidates=%d err=%v", requestSeq, time.Since(started), len(candidates), err)
 	if updateResp != nil && sender != nil {
 		sender(updateResp)
+	}
+}
+
+func friendlyGhostError(err error) string {
+	if err == nil {
+		return "本地 AI 暂不可用"
+	}
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "Model file was not found"),
+		strings.Contains(message, "模型文件"):
+		return "本地 AI 暂不可用：未找到模型文件"
+	case strings.Contains(message, "llama-server.exe was not found"):
+		return "本地 AI 暂不可用：未安装模型运行程序"
+	case strings.Contains(message, "timed out"),
+		strings.Contains(message, "deadline exceeded"):
+		return "本地 AI 启动超时，请稍后重试"
+	default:
+		return "本地 AI 暂不可用"
 	}
 }
 
