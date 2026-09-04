@@ -18,9 +18,13 @@ import (
 func resolveRealRimeDataDir(t *testing.T) string {
 	t.Helper()
 
-	candidates := []string{
-		filepath.Join(`C:\Program Files (x86)\MoqiIM\moqi-ime`, "input_methods", "rime", "data"),
+	candidates := []string{}
+	if configured := strings.TrimSpace(os.Getenv("MOQI_RIME_DATA_DIR")); configured != "" {
+		candidates = append(candidates, configured)
 	}
+	candidates = append(candidates,
+		filepath.Join(`C:\Program Files (x86)\MoqiIM\moqi-ime`, "input_methods", "rime", "data"),
+	)
 
 	wd, err := os.Getwd()
 	if err == nil {
@@ -40,6 +44,12 @@ func resolveRealRimeDataDir(t *testing.T) string {
 func resolveRealRimeUserDir(t *testing.T) string {
 	t.Helper()
 
+	if configured := strings.TrimSpace(os.Getenv("MOQI_RIME_USER_DIR")); configured != "" {
+		if err := os.MkdirAll(configured, 0o700); err != nil {
+			t.Fatalf("create configured user dir %q: %v", configured, err)
+		}
+		return configured
+	}
 	appData := os.Getenv("APPDATA")
 	if appData == "" {
 		t.Skip("APPDATA is not set")

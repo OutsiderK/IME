@@ -252,14 +252,6 @@ func (s *Server) handleRequest(clientID string, req *imecore.Request) *imecore.R
 		}
 		return &imecore.Response{SeqNum: req.SeqNum, Success: true}
 
-	case "cloudClipboardUpload":
-		rime.UploadCloudClipboardFromLauncher(req.CloudClipboardText)
-		return &imecore.Response{
-			SeqNum:      req.SeqNum,
-			Success:     true,
-			ReturnValue: 1,
-		}
-
 	case "onActivate", "onDeactivate", "filterKeyDown", "onKeyDown",
 		"filterKeyUp", "onKeyUp", "onCommand", "onMenu", "onCompositionTerminated",
 		"onPreservedKey", "onLangProfileActivated", "highlightCandidate",

@@ -67,8 +67,6 @@ public:
 
 	void handleClientMessage(PipeClient* client, const moqi::protocol::ClientRequest& request);
 
-	void uploadCloudClipboardText(const std::string& utf8Text);
-
 private:
     void sendWarmupRequests();
 

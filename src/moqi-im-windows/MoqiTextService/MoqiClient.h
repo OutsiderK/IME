@@ -27,6 +27,7 @@
 
 #include <deque>
 #include <atomic>
+#include <memory>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -36,6 +37,7 @@
 namespace Moqi {
 
 class TextService;
+struct AsyncCallbackState;
 
 struct AutoPairRuleState {
 	std::wstring open;
@@ -103,9 +105,11 @@ private:
     bool completeConnectionHandshake();
     bool callRpcPipe(HANDLE pipe, const std::string& serializedRequest, std::string& serializedReply, bool* timedOut = nullptr);
     bool readPipeMessageWithTimeout(HANDLE pipe, std::string& message, DWORD timeoutMs, bool* timedOut = nullptr);
+	bool writePipeMessageWithTimeout(HANDLE pipe, const std::string& message, DWORD timeoutMs);
 	bool waitForRpcIdle(int timeoutMs) const;
 	bool readPendingPipeMessage(std::string& serializedReply);
 	void refreshAsyncPollTimer();
+	void stopAsyncPollTimer();
 	void pollAsyncResponses();
 	void enqueueAsyncResponse(const moqi::protocol::ServerResponse& response);
 	void flushPendingAsyncResponsesWithCurrentContext();
@@ -155,6 +159,8 @@ private:
 	HWND asyncPollTimerWindow_;
 	UINT_PTR asyncPollTimerId_;
 	bool asyncFlushInProgress_;
+	bool asyncApplyInProgress_;
+	std::shared_ptr<AsyncCallbackState> asyncCallbackState_;
 	std::deque<Json::Value> pendingAsyncResponses_;
 	std::vector<AutoPairRuleState> autoPairRules_;
 };

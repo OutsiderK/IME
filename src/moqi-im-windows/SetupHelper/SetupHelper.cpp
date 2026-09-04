@@ -240,10 +240,13 @@ std::wstring GetSyswow64DirectoryPath() {
 }
 
 std::wstring GetNativeSystemDirectoryPath() {
-  const fs::path sysnative =
-      fs::path(GetWindowsDirectoryPath()) / L"Sysnative";
-  if (fs::exists(sysnative)) {
-    return sysnative.wstring();
+  // SetupHelper is a Win32 executable. Under WOW64, GetSystemDirectoryW and
+  // filesystem existence checks are redirected to SysWOW64. The virtual
+  // Sysnative alias is intentionally not enumerable, but it is the correct
+  // path for 32-bit code to address the native System32 directory.
+  BOOL is_wow64 = FALSE;
+  if (IsWow64Process(GetCurrentProcess(), &is_wow64) == TRUE && is_wow64) {
+    return (fs::path(GetWindowsDirectoryPath()) / L"Sysnative").wstring();
   }
 
   std::wstring path(MAX_PATH, L'\0');
@@ -270,6 +273,23 @@ std::wstring NormalizePathForPendingOperation(const std::wstring& path) {
         .wstring();
   }
   return path;
+}
+
+BOOL MoveFileExWithoutWow64Redirection(const wchar_t* existing_path,
+                                       const wchar_t* new_path,
+                                       const DWORD flags) {
+  PVOID previous_redirection = nullptr;
+  const BOOL redirection_disabled =
+      Wow64DisableWow64FsRedirection(&previous_redirection);
+  const BOOL result = MoveFileExW(existing_path, new_path, flags);
+  const DWORD move_error = result == TRUE ? ERROR_SUCCESS : GetLastError();
+  if (redirection_disabled == TRUE) {
+    Wow64RevertWow64FsRedirection(previous_redirection);
+  }
+  if (result != TRUE) {
+    SetLastError(move_error);
+  }
+  return result;
 }
 
 bool RunProcess(const std::wstring& application_path,
@@ -427,8 +447,9 @@ bool RenameFileForDeleteOnReboot(const fs::path& path, bool& reboot_required) {
       TRUE) {
     const std::wstring pending_delete_path =
         NormalizePathForPendingOperation(old_path.wstring());
-    if (MoveFileExW(pending_delete_path.c_str(), nullptr,
-                    MOVEFILE_DELAY_UNTIL_REBOOT) ==
+    if (MoveFileExWithoutWow64Redirection(
+            pending_delete_path.c_str(), nullptr,
+            MOVEFILE_DELAY_UNTIL_REBOOT) ==
         TRUE) {
       reboot_required = true;
       return true;
@@ -458,9 +479,10 @@ bool ScheduleReplaceOnReboot(const fs::path& source,
       NormalizePathForPendingOperation(staged_source.wstring());
   const std::wstring normalized_destination =
       NormalizePathForPendingOperation(destination.wstring());
-  if (MoveFileExW(normalized_staged_source.c_str(),
-                  normalized_destination.c_str(),
-                  MOVEFILE_DELAY_UNTIL_REBOOT | MOVEFILE_REPLACE_EXISTING) !=
+  if (MoveFileExWithoutWow64Redirection(
+          normalized_staged_source.c_str(),
+          normalized_destination.c_str(),
+          MOVEFILE_DELAY_UNTIL_REBOOT | MOVEFILE_REPLACE_EXISTING) !=
       TRUE) {
     const DWORD move_error = GetLastError();
     std::error_code ec;
@@ -511,49 +533,6 @@ bool DeleteReregisterTask() {
     return false;
   }
   return exit_code == 0 || exit_code == 1;
-}
-
-// Create a per-user "at logon" scheduled task that starts MoqiLauncher.exe.
-// This is a backup for the HKCU Run key: it runs in the interactive user
-// session even if the Run key is disabled/delayed, so by the time the TSF
-// framework activates Moqi at logon the launcher pipe is already listening.
-// Best-effort only: failure must not fail the install (the Run key remains the
-// primary autostart path).
-bool ScheduleLauncherAutostartTask(const Options& options, std::wstring* error) {
-  const fs::path launcher_path =
-      fs::path(options.app_dir) / L"MoqiLauncher.exe";
-  if (!fs::exists(launcher_path)) {
-    if (error != nullptr) {
-      *error = L"MoqiLauncher.exe not found in app dir; skip autostart task.";
-    }
-    return false;
-  }
-  const fs::path schtasks =
-      fs::path(GetNativeSystemDirectoryForChildProcess()) / L"schtasks.exe";
-  const std::wstring task_command = QuoteCommandLineArgument(launcher_path.wstring());
-  std::wstring command = QuoteCommandLineArgument(schtasks.wstring()) +
-                         L" /Create /TN " +
-                         QuoteCommandLineArgument(kLauncherAutostartTaskName) +
-                         L" /SC ONLOGON /TR " +
-                         QuoteCommandLineArgument(task_command) + L" /F";
-  DWORD exit_code = 0;
-  DWORD error_code = 0;
-  if (!RunProcess(schtasks.wstring(), command, GetModuleDirectory(), &exit_code,
-                  &error_code)) {
-    if (error != nullptr) {
-      *error = L"Failed to launch schtasks.exe (" +
-               FormatWindowsErrorMessage(error_code) + L").";
-    }
-    return false;
-  }
-  if (exit_code != 0) {
-    if (error != nullptr) {
-      *error = L"Failed to schedule launcher autostart task (schtasks exit code " +
-               std::to_wstring(exit_code) + L").";
-    }
-    return false;
-  }
-  return true;
 }
 
 bool DeleteLauncherAutostartTask() {
@@ -783,9 +762,9 @@ int RunInstall(const Options& options) {
     return ShowFailureAndReturn(L"Failed to register x64 TSF DLL.",
                                 options.silent);
   }
-  // Backup autostart for the launcher (the HKCU Run key remains primary).
-  std::wstring autostart_error;
-  ScheduleLauncherAutostartTask(options, &autostart_error);
+  // Older installers created a second, hidden logon trigger. Remove it so the
+  // visible HKCU Run entry remains the single source of launcher autostart.
+  DeleteLauncherAutostartTask();
   return kExitSuccess;
 }
 

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +35,16 @@ const (
 	ID_HELP_DOCS           = 21
 	ID_DISCUSSIONS         = 22
 	ID_DOWNLOAD_SCHEME_SET = 23
+	ID_AI_ENABLED          = 30
+	ID_AI_MODE_SMART       = 31
+	ID_AI_MODE_RESIDENT    = 32
+	ID_AI_MODE_MANUAL      = 33
+	ID_AI_IDLE_10          = 34
+	ID_AI_IDLE_30          = 35
+	ID_AI_IDLE_NEVER       = 36
+	ID_OPEN_AI_CONFIG      = 37
+	ID_IMPORT_USER_DICT    = 38
+	ID_EXPORT_USER_DICT    = 39
 	ID_SCHEMA_BASE         = 1000
 	ID_SWITCH_BASE         = 2000
 	ID_SCHEME_SET_BASE     = 3000
@@ -219,6 +228,9 @@ type IME struct {
 	ghostConfig                  aiCompletionConfig
 	ghostGenerator               func(aiCompletionRequest, aiCompletionConfig) ([]string, error)
 	ghostTimer                   *time.Timer
+	ghostLoadingTimer            *time.Timer
+	ghostLoadingDelay            time.Duration
+	ghostLoadingVisible          bool
 	ghostRequestSeq              uint64
 	ghostPending                 bool
 	ghostReady                   bool
@@ -252,12 +264,7 @@ type IME struct {
 	customPhraseConsumeKeyUpCode int
 	superAbbrevConsumeKeyUpCode  int
 	secondSelectConsumeKeyUpCode int
-	cloudClipboardActive         bool
-	cloudClipboardPending        bool
-	cloudClipboardEntries        []cloudClipboardEntry
-	cloudClipboardCursor         int
-	cloudClipboardPage           int
-	cloudClipboardRequestSeq     uint64
+	productSettings              productSettings
 }
 
 type aiAsyncResult struct {
@@ -272,21 +279,21 @@ func defaultStyle() Style {
 	return Style{
 		DisplayTrayIcon:                true,
 		CandidateFormat:                "{0} {1}",
-		CandidatePerRow:                1,
-		CandidateCount:                 9,
+		CandidatePerRow:                7,
+		CandidateCount:                 7,
 		CandidateUseCursor:             true,
-		CandidateTheme:                 "default",
-		CandidateBackgroundColor:       "#ffffff",
-		CandidateHighlightColor:        "#c6ddf9",
-		CandidateTextColor:             "#000000",
-		CandidateHighlightTextColor:    "#000000",
-		CandidateCommentColor:          "#000000",
-		CandidateCommentHighlightColor: "#000000",
-		CandidateSpacing:               20,
-		FontFace:                       "Segoe UI",
-		FontPoint:                      16,
-		CandidateCommentFontFace:       "Consolas",
-		CandidateCommentFontPoint:      14,
+		CandidateTheme:                 "mist-shore",
+		CandidateBackgroundColor:       "#fcfdfb",
+		CandidateHighlightColor:        "#e3edf0",
+		CandidateTextColor:             "#142a38",
+		CandidateHighlightTextColor:    "#142a38",
+		CandidateCommentColor:          "#60747b",
+		CandidateCommentHighlightColor: "#425d68",
+		CandidateSpacing:               34,
+		FontFace:                       "Noto Sans SC",
+		FontPoint:                      13,
+		CandidateCommentFontFace:       "Noto Sans SC",
+		CandidateCommentFontPoint:      10,
 		InlinePreedit:                  "composition",
 		SoftCursor:                     false,
 	}
@@ -302,19 +309,26 @@ func New(client *imecore.Client) imecore.TextService {
 	if err != nil {
 		log.Printf("加载 AI 配置失败: %v", err)
 	}
-	generator := newConfiguredAIReviewGenerator(cfg)
-	actions := defaultAIActions(cfg)
+	settings := loadProductSettings()
 	ime := &IME{
-		TextServiceBase:   imecore.NewTextServiceBase(client),
-		style:             defaultStyle(),
-		aiEnabled:         generator != nil && len(actions) > 0,
-		aiActions:         actions,
-		aiReviewGenerator: generator,
+		TextServiceBase: imecore.NewTextServiceBase(client),
+		style:           defaultStyle(),
+		// The personal Windows edition exposes only local completion. Keep the
+		// legacy review hooks available to tests/migration code, but never wire
+		// generic configurable actions into the product path.
+		aiEnabled:         false,
+		aiActions:         nil,
+		aiReviewGenerator: nil,
 		aiResultCh:        make(chan aiAsyncResult, 4),
 		schemeSetVersion:  currentSchemeSetVersion(),
+		productSettings:   settings,
 	}
 	ime.configureGhostCompletion(cfg)
 	ime.loadAppearancePrefs()
+	// Product visuals are deliberately fixed. Loading the legacy preference
+	// file still migrates useful input behavior, but must not reintroduce the
+	// old skin/font/color surface.
+	ime.style = defaultStyle()
 	return ime
 }
 
@@ -392,8 +406,6 @@ func (ime *IME) HandleRequest(req *imecore.Request) *imecore.Response {
 		return ime.changePage(req, resp)
 	case "deleteCandidateOnCurrentPage":
 		return ime.deleteCandidateOnCurrentPage(req, resp)
-	case "cloudClipboardUpload":
-		return ime.onCloudClipboardUpload(req, resp)
 	default:
 		resp.ReturnValue = 0
 		return resp
@@ -406,7 +418,7 @@ func (ime *IME) onActivate(req *imecore.Request, resp *imecore.Response) *imecor
 	// Re-register to make activation idempotent and to replace stale shortcut
 	// definitions left by an older frontend/backend pair.
 	resp.RemovePreservedKey = append(resp.RemovePreservedKey,
-		cloudClipboardListPreservedKeyGUID, ghostPreservedKeyGUID,
+		ghostPreservedKeyGUID,
 		ghostLongPreservedKeyGUID, ghostNextPreservedKeyGUID)
 	if ime.ghostCompletionEnabled() {
 		resp.AddPreservedKey = append(resp.AddPreservedKey, ghostPreservedKeyInfos()...)
@@ -418,11 +430,10 @@ func (ime *IME) onActivate(req *imecore.Request, resp *imecore.Response) *imecor
 func (ime *IME) onDeactivate(req *imecore.Request, resp *imecore.Response) *imecore.Response {
 	debugLogf("RIME 输入法已失活")
 	ime.activationUIRefreshPending = false
-	ime.resetCloudClipboardState()
 	ime.resetGhostCompletion()
 	resp.HideMessage = true
 	resp.RemovePreservedKey = append(resp.RemovePreservedKey,
-		cloudClipboardListPreservedKeyGUID, ghostPreservedKeyGUID,
+		ghostPreservedKeyGUID,
 		ghostLongPreservedKeyGUID, ghostNextPreservedKeyGUID)
 	ime.destroySession(resp)
 	ime.removeButtons(resp)
@@ -432,9 +443,6 @@ func (ime *IME) onDeactivate(req *imecore.Request, resp *imecore.Response) *imec
 
 func (ime *IME) onPreservedKey(req *imecore.Request, resp *imecore.Response) *imecore.Response {
 	if ime.handleGhostPreservedKey(req, resp) {
-		return resp
-	}
-	if ime.handleCloudClipboardPreservedKey(req, resp) {
 		return resp
 	}
 	resp.ReturnValue = 0
@@ -452,9 +460,6 @@ func (ime *IME) filterKeyDown(req *imecore.Request, resp *imecore.Response) *ime
 	if ime.handleAIKeyDownFilter(req, resp) {
 		return resp
 	}
-	if ime.handleCloudClipboardKeyDownFilter(req, resp) {
-		return resp
-	}
 	if ime.handleCustomPhraseKeyDownFilter(req, resp) {
 		return resp
 	}
@@ -467,7 +472,7 @@ func (ime *IME) filterKeyDown(req *imecore.Request, resp *imecore.Response) *ime
 	if ime.activationUIRefreshPending {
 		ime.createSession(resp)
 	}
-	if !isAndroidSoftKeyboardRequest(req) && ime.lastKeyDownCode == req.KeyCode {
+	if ime.lastKeyDownCode == req.KeyCode {
 		ime.lastKeySkip++
 		if ime.lastKeySkip >= 2 {
 			ime.lastKeyDownCode = 0
@@ -517,9 +522,6 @@ func (ime *IME) filterKeyUp(req *imecore.Request, resp *imecore.Response) *imeco
 	if ime.handleAIKeyUpFilter(req, resp) {
 		return resp
 	}
-	if ime.handleCloudClipboardKeyUpFilter(req, resp) {
-		return resp
-	}
 	if ime.handleCustomPhraseKeyUpFilter(req, resp) {
 		return resp
 	}
@@ -543,14 +545,6 @@ func (ime *IME) filterKeyUp(req *imecore.Request, resp *imecore.Response) *imeco
 	ime.lastKeySkip = 0
 	resp.ReturnValue = boolToInt(ime.lastKeyUpRet)
 	return resp
-}
-
-func isAndroidSoftKeyboardRequest(req *imecore.Request) bool {
-	if req == nil || req.Data == nil {
-		return false
-	}
-	source, _ := req.Data["source"].(string)
-	return strings.EqualFold(strings.TrimSpace(source), "android")
 }
 
 func (ime *IME) currentInputModeState() (asciiMode bool, fullShape bool, ok bool) {
@@ -585,9 +579,6 @@ func (ime *IME) onKeyDown(req *imecore.Request, resp *imecore.Response) *imecore
 	if ime.handleAIKeyDown(req, resp) {
 		return resp
 	}
-	if ime.handleCloudClipboardKeyDown(req, resp) {
-		return resp
-	}
 	if ime.handleCustomPhraseKeyDown(req, resp) {
 		return resp
 	}
@@ -611,9 +602,6 @@ func (ime *IME) onKeyUp(req *imecore.Request, resp *imecore.Response) *imecore.R
 		return resp
 	}
 	if ime.handleAIKeyUp(req, resp) {
-		return resp
-	}
-	if ime.handleCloudClipboardKeyUp(req, resp) {
 		return resp
 	}
 	if ime.handleCustomPhraseKeyUp(req, resp) {
@@ -667,13 +655,6 @@ func (ime *IME) onCompositionTerminated(req *imecore.Request, resp *imecore.Resp
 	} else {
 		ime.resetAIState()
 	}
-	if (ime.cloudClipboardActive || ime.cloudClipboardPending) && !req.Forced {
-		debugLogf("云剪贴板候选显示中，忽略非强制 composition terminated active=%t pending=%t", ime.cloudClipboardActive, ime.cloudClipboardPending)
-		ime.fillCloudClipboardResponse(resp)
-		resp.ReturnValue = 1
-		return resp
-	}
-	ime.resetCloudClipboardState()
 	ime.resetCustomPhraseOverlay()
 	ime.resetSuperAbbrevOverlay()
 	ime.resetSecondSelectionShortcut()
@@ -962,22 +943,59 @@ func (ime *IME) onCommand(req *imecore.Request, resp *imecore.Response) *imecore
 			return resp
 		}
 	case ID_SYNC:
-		if !ime.syncUserDataCommand(resp) {
+		if !ime.importUserDictionary(resp) {
+			resp.ReturnValue = 0
+			return resp
+		}
+	case ID_EXPORT_USER_DICT:
+		if !ime.exportUserDictionary(resp) {
+			resp.ReturnValue = 0
+			return resp
+		}
+	case ID_IMPORT_USER_DICT:
+		if !ime.importUserDictionary(resp) {
+			resp.ReturnValue = 0
+			return resp
+		}
+	case ID_AI_ENABLED:
+		ime.productSettings.AIEnabled = !ime.productSettings.AIEnabled
+		if !ime.applyLocalAISettings(resp) {
+			resp.ReturnValue = 0
+			return resp
+		}
+	case ID_AI_MODE_SMART, ID_AI_MODE_RESIDENT, ID_AI_MODE_MANUAL:
+		switch commandID {
+		case ID_AI_MODE_RESIDENT:
+			ime.productSettings.AIRunMode = aiRunModeResident
+		case ID_AI_MODE_MANUAL:
+			ime.productSettings.AIRunMode = aiRunModeManual
+		default:
+			ime.productSettings.AIRunMode = aiRunModeSmart
+		}
+		if !ime.applyLocalAISettings(resp) {
+			resp.ReturnValue = 0
+			return resp
+		}
+	case ID_AI_IDLE_10, ID_AI_IDLE_30, ID_AI_IDLE_NEVER:
+		switch commandID {
+		case ID_AI_IDLE_10:
+			ime.productSettings.AIIdleExitMinutes = 10
+		case ID_AI_IDLE_NEVER:
+			ime.productSettings.AIIdleExitMinutes = 0
+		default:
+			ime.productSettings.AIIdleExitMinutes = 30
+		}
+		if !ime.applyLocalAISettings(resp) {
+			resp.ReturnValue = 0
+			return resp
+		}
+	case ID_OPEN_AI_CONFIG:
+		if !ime.openAIConfig(resp) {
 			resp.ReturnValue = 0
 			return resp
 		}
 	case ID_UPDATE_CONFIG:
 		if !ime.updateConfigAsync(resp) {
-			resp.ReturnValue = 0
-			return resp
-		}
-	case ID_DOWNLOAD_SCHEME_SET:
-		if !ime.downloadSchemeSetAsync(req, resp) {
-			resp.ReturnValue = 0
-			return resp
-		}
-	case ID_APPEARANCE_IMPORT_SKIN:
-		if !ime.importAppearanceSkinAsync(resp) {
 			resp.ReturnValue = 0
 			return resp
 		}
@@ -1001,7 +1019,13 @@ func (ime *IME) onCommand(req *imecore.Request, resp *imecore.Response) *imecore
 	case ID_SHARED_DIR:
 		ime.openPath(ime.sharedDir())
 	case ID_SYNC_DIR:
-		ime.openPath(filepath.Join(ime.userDir(), "sync"))
+		path, err := ime.userDictionarySnapshotDir()
+		if err != nil {
+			resp.TrayNotification = trayNotification("无法打开词库快照目录: "+err.Error(), imecore.TrayNotificationIconError)
+			resp.ReturnValue = 0
+			return resp
+		}
+		ime.openPath(path)
 	case ID_LOG_DIR:
 		logDir := rimeLogDir()
 		if logDir != "" {
@@ -1014,22 +1038,7 @@ func (ime *IME) onCommand(req *imecore.Request, resp *imecore.Response) *imecore
 		ime.openURL(helpDocsURL)
 	case ID_DISCUSSIONS:
 		ime.openURL(discussionURL)
-	case ID_WEBDAV_SETTINGS:
-		if !ime.openWebDAVSettingsAsync(resp) {
-			resp.ReturnValue = 0
-			return resp
-		}
-	case ID_CLOUD_CLIPBOARD_SETTINGS:
-		if !ime.openCloudClipboardSettingsAsync(resp) {
-			resp.ReturnValue = 0
-			return resp
-		}
-	case ID_CLOUD_CLIPBOARD_ENABLED:
-		ime.toggleCloudClipboardEnabled(resp)
-	case ID_CLOUD_CLIPBOARD_TEST:
-		ime.testCloudClipboardConnectionCommand(resp)
 	default:
-		previousCandidateCount := ime.candidateCount()
 		if commandID == ID_SHARED_INPUT_STATE {
 			ime.toggleInputStateShared()
 			resp.ReturnValue = 1
@@ -1070,19 +1079,6 @@ func (ime *IME) onCommand(req *imecore.Request, resp *imecore.Response) *imecore
 			ime.resetAIState()
 			resp.ReturnValue = 1
 			ime.updateLangStatus(req, resp)
-			return resp
-		}
-		if ime.applyAppearanceCommand(commandID) {
-			if isCandidateCountCommand(commandID) && ime.candidateCount() != previousCandidateCount {
-				if !ime.applyCandidateCountConfig(resp) {
-					resp.ReturnValue = 0
-					return resp
-				}
-			}
-			resp.CustomizeUI = ime.customizeUIMap()
-			ime.fillResponseFromCurrentState(resp)
-			ime.updateLangStatus(req, resp)
-			resp.ReturnValue = 1
 			return resp
 		}
 		if ime.isKnownDynamicCommand(commandID) {
@@ -1141,14 +1137,6 @@ func (ime *IME) Init(req *imecore.Request) bool {
 	sharedDir := filepath.Join(exeDir, "input_methods", "rime", "data")
 	userDir := ime.userDir()
 
-	if androidSharedDir, androidUserDir, ok := androidRimeDirs(); ok {
-		sharedDir = androidSharedDir
-		userDir = androidUserDir
-		if _, err := os.Stat(filepath.Join(userDir, "build")); os.IsNotExist(err) {
-			firstRun = true
-		}
-	}
-
 	if userDir == "" {
 		log.Println("未找到 APPDATA，原生 RIME 不可用")
 		return true
@@ -1177,9 +1165,6 @@ func (ime *IME) Init(req *imecore.Request) bool {
 	} else {
 		ime.backend = nil
 		log.Printf("RIME 原生后端不可用 sharedDir=%s userDir=%s", sharedDir, userDir)
-		if runtime.GOOS == "android" {
-			return false
-		}
 	}
 	return true
 }
@@ -1784,15 +1769,6 @@ func (ime *IME) applyDeleteCandidate(req *imecore.Request, resp *imecore.Respons
 	if ime.aiActive {
 		return false
 	}
-	if ime.cloudClipboardActive {
-		absolute, ok := ime.cloudClipboardVisibleIndex(index)
-		if !ok {
-			return false
-		}
-		ime.cloudClipboardCursor = absolute
-		ime.deleteCurrentCloudClipboardEntry(resp)
-		return true
-	}
 	if _, customCandidates, backendIndexes, ok := ime.currentCustomPhraseOverlay(); ok {
 		if index < len(customCandidates) {
 			return false
@@ -1834,9 +1810,6 @@ func (ime *IME) applyCandidateHighlight(req *imecore.Request, resp *imecore.Resp
 		ime.fillAIResponse(resp)
 		return true
 	}
-	if ime.applyCloudClipboardCandidateHighlight(req, resp) {
-		return true
-	}
 	if _, customCandidates, backendIndexes, ok := ime.currentCustomPhraseOverlay(); ok {
 		total := len(customCandidates) + len(backendIndexes)
 		if index >= total {
@@ -1866,9 +1839,6 @@ func (ime *IME) applyCandidateSelection(req *imecore.Request, resp *imecore.Resp
 		}
 		return ime.commitBackendOverlayCandidate(resp, index-aiCandidates)
 	}
-	if ime.applyCloudClipboardCandidateSelection(req, resp) {
-		return true
-	}
 	if _, customCandidates, backendIndexes, ok := ime.currentCustomPhraseOverlay(); ok {
 		total := len(customCandidates) + len(backendIndexes)
 		if index >= total {
@@ -1895,11 +1865,6 @@ func (ime *IME) applyCandidatePageChange(req *imecore.Request, resp *imecore.Res
 	if ime.aiActive {
 		ime.fillAIResponse(resp)
 		return false
-	}
-	if ime.cloudClipboardActive {
-		ime.changeCloudClipboardPage(req.PageBackward, resp)
-		ime.fillCloudClipboardResponse(resp)
-		return true
 	}
 	if _, _, _, ok := ime.currentCustomPhraseOverlay(); ok {
 		ime.fillResponseFromCurrentState(resp)
@@ -2006,10 +1971,6 @@ func (ime *IME) shouldPassThroughModifierOnKey(req *imecore.Request, filterHandl
 func (ime *IME) onKey(req *imecore.Request, resp *imecore.Response) bool {
 	if ime.aiActive {
 		ime.fillAIResponse(resp)
-		return true
-	}
-	if ime.cloudClipboardActive {
-		ime.fillCloudClipboardResponse(resp)
 		return true
 	}
 	if ime.backend == nil {
@@ -2232,12 +2193,12 @@ func (ime *IME) reloadAIConfig() error {
 	if err != nil {
 		return err
 	}
-	ime.aiReviewGenerator = newConfiguredAIReviewGenerator(cfg)
-	ime.aiActions = defaultAIActions(cfg)
-	ime.aiEnabled = ime.aiReviewGenerator != nil && len(ime.aiActions) > 0
+	ime.aiReviewGenerator = nil
+	ime.aiActions = nil
+	ime.aiEnabled = false
 	ime.resetAIState()
 	ime.configureGhostCompletion(cfg)
-	debugLogf("AI 配置已重新加载 enabled=%t actions=%d ghost=%t", ime.aiEnabled, len(ime.aiActions), ime.ghostEnabled)
+	debugLogf("本地 AI 配置已重新加载 ghost=%t", ime.ghostEnabled)
 	return nil
 }
 
@@ -2371,10 +2332,6 @@ func (ime *IME) fillResponseFromCurrentState(resp *imecore.Response) {
 		ime.fillAIResponse(resp)
 		return
 	}
-	if ime.cloudClipboardActive {
-		ime.fillCloudClipboardResponse(resp)
-		return
-	}
 	ime.fillResponseFromBackendState(resp, false)
 }
 
@@ -2502,12 +2459,6 @@ func (ime *IME) isKnownDynamicCommand(commandID int) bool {
 			}
 		}
 	}
-	if index, ok := themeCommandIndex(commandID); ok {
-		themes := listThemes()
-		if index >= 0 && index < len(themes) {
-			return true
-		}
-	}
 	return false
 }
 
@@ -2619,144 +2570,21 @@ func (ime *IME) schemaMenuItems() []map[string]interface{} {
 	return items
 }
 
-func (ime *IME) MobileSchemaEntries() []string {
-	ime.mu.Lock()
-	defer ime.mu.Unlock()
-	ime.createSession(nil)
-	if ime.backend == nil {
-		return nil
-	}
-	schemas := ime.backend.SchemaList()
-	currentSchemaID := strings.TrimSpace(ime.backend.CurrentSchemaID())
-	entries := make([]string, 0, len(schemas))
-	for _, schema := range schemas {
-		schemaID := strings.TrimSpace(schema.ID)
-		if schemaID == "" {
-			continue
-		}
-		name := strings.TrimSpace(schema.Name)
-		if name == "" {
-			name = schemaID
-		}
-		selected := "0"
-		if schemaID == currentSchemaID {
-			selected = "1"
-		}
-		entries = append(entries, schemaID+"\t"+name+"\t"+selected)
-	}
-	return entries
-}
-
-func (ime *IME) MobileMenuEntries() []string {
-	ime.mu.Lock()
-	defer ime.mu.Unlock()
-	ime.createSession(nil)
-	return flattenMobileMenuEntries("", ime.buildMenu())
-}
-
-func (ime *IME) MobileCurrentSchemaID() string {
-	ime.mu.Lock()
-	defer ime.mu.Unlock()
-	ime.createSession(nil)
+func (ime *IME) currentSchemaDisplayName() string {
 	if ime.backend == nil {
 		return ""
 	}
-	return strings.TrimSpace(ime.backend.CurrentSchemaID())
-}
-
-func (ime *IME) MobileSelectSchema(schemaID string) bool {
-	ime.mu.Lock()
-	defer ime.mu.Unlock()
-	return ime.selectSchemaByIDLocked(schemaID)
-}
-
-func (ime *IME) MobileReplayText(text string, seqNum int) *imecore.Response {
-	ime.mu.Lock()
-	defer ime.mu.Unlock()
-
-	debugLogf("RIME MobileReplayText seq=%d text=%q", seqNum, previewReplayText(text))
-	resp := imecore.NewResponse(seqNum, true)
-	ime.createSession(resp)
-	if ime.backend == nil {
-		resp.Success = false
-		resp.Error = "rime backend is not available"
-		log.Printf("RIME MobileReplayText failed seq=%d error=%q", seqNum, resp.Error)
-		return resp
-	}
-
-	ime.resetAIState()
-	ime.resetCustomPhraseOverlay()
-	ime.resetSuperAbbrevOverlay()
-	ime.resetSecondSelectionShortcut()
-	ime.resetTrackedRawInput()
-	ime.clearResponse(resp)
-	ime.backend.ClearComposition()
-	ime.keyComposing = false
-
-	for _, ch := range text {
-		req := &imecore.Request{
-			Method:   "replayText",
-			SeqNum:   seqNum,
-			KeyCode:  replayKeyCodeForRune(ch),
-			CharCode: int(ch),
-			Data: map[string]interface{}{
-				"source": "android",
-			},
-		}
-		ime.processKey(req, false)
-	}
-
-	ime.fillResponseFromCurrentState(resp)
-	resp.ReturnValue = 1
-	debugLogf(
-		"RIME MobileReplayText result seq=%d composition=%q candidateCount=%d",
-		seqNum,
-		resp.CompositionString,
-		len(resp.CandidateList),
-	)
-	return resp
-}
-
-func previewReplayText(text string) string {
-	const maxReplayLogRunes = 64
-	runes := []rune(text)
-	if len(runes) <= maxReplayLogRunes {
-		return text
-	}
-	return string(runes[:maxReplayLogRunes]) + "..."
-}
-
-func replayKeyCodeForRune(ch rune) int {
-	// Apostrophe is the pinyin separator, but its ASCII code also equals vkRight.
-	// Leave KeyCode empty so translateKeyCode forwards it as a printable char.
-	if ch == '\'' {
-		return 0
-	}
-	return int(ch)
-}
-
-func (ime *IME) MobileSelectSchemeSet(name string, seqNum int) *imecore.Response {
-	target := normalizeSchemeSetName(name)
-	names := availableSchemeSets()
-	for index, candidate := range names {
-		if candidate != target {
+	currentSchemaID := ime.backend.CurrentSchemaID()
+	for _, schema := range ime.backend.SchemaList() {
+		if schema.ID != currentSchemaID {
 			continue
 		}
-		commandID := schemeSetCommandID(index)
-		return ime.HandleRequest(&imecore.Request{
-			Method:      "onCommand",
-			SeqNum:      seqNum,
-			ID:          imecore.FlexibleID{Int: commandID, IsInt: true},
-			CommandType: commandID,
-			Data: map[string]interface{}{
-				"commandId": float64(commandID),
-				"source":    "android",
-			},
-		})
+		if name := strings.TrimSpace(schema.Name); name != "" {
+			return name
+		}
+		return strings.TrimSpace(schema.ID)
 	}
-	resp := imecore.NewResponse(seqNum, false)
-	resp.Error = fmt.Sprintf("unknown scheme set: %s", name)
-	return resp
+	return ""
 }
 
 func (ime *IME) handleSchemaCommand(commandID int) bool {
@@ -2801,57 +2629,6 @@ func (ime *IME) selectSchemaByIDLocked(schemaID string) bool {
 		ime.syncSharedInputStateFromBackendIfChanged()
 	}
 	return true
-}
-
-func flattenMobileMenuEntries(group string, items []map[string]interface{}) []string {
-	entries := make([]string, 0, len(items))
-	for _, item := range items {
-		text := strings.TrimSpace(fmt.Sprint(item["text"]))
-		if text == "" {
-			continue
-		}
-		nextGroup := group
-		if nextGroup == "" {
-			nextGroup = text
-		} else {
-			nextGroup = nextGroup + "/" + text
-		}
-		if submenu, ok := item["submenu"].([]map[string]interface{}); ok {
-			entries = append(entries, flattenMobileMenuEntries(nextGroup, submenu)...)
-			continue
-		}
-		commandID := 0
-		if raw, ok := item["id"].(int); ok {
-			commandID = raw
-		}
-		checked, _ := item["checked"].(bool)
-		enabled := true
-		if raw, ok := item["enabled"].(bool); ok {
-			enabled = raw
-		}
-		entries = append(entries, strings.Join([]string{
-			sanitizeMobileMenuField(group),
-			fmt.Sprint(commandID),
-			sanitizeMobileMenuField(text),
-			boolString(checked),
-			boolString(enabled),
-		}, "\t"))
-	}
-	return entries
-}
-
-func sanitizeMobileMenuField(value string) string {
-	value = strings.ReplaceAll(value, "\t", " ")
-	value = strings.ReplaceAll(value, "\r", " ")
-	value = strings.ReplaceAll(value, "\n", " ")
-	return strings.TrimSpace(value)
-}
-
-func boolString(value bool) string {
-	if value {
-		return "1"
-	}
-	return "0"
 }
 
 func (ime *IME) updateLangStatus(req *imecore.Request, resp *imecore.Response) {
@@ -3229,155 +3006,74 @@ func (ime *IME) iconPath(name string) string {
 }
 
 func (ime *IME) buildMenu() []map[string]interface{} {
-	menuSwitches := ime.menuSwitches()
-	schemeSetItems := schemeSetMenuItems()
-	schemaItems := ime.schemaMenuItems()
-	items := make([]map[string]interface{}, 0, len(menuSwitches)+len(schemeSetItems)+10)
-	for i, sw := range menuSwitches {
-		enabled := ime.backend != nil && ime.backend.GetOption(sw.Name)
-		items = append(items, map[string]interface{}{
-			"id":      switchCommandID(i),
-			"text":    switchMenuText(sw, enabled),
-			"checked": enabled,
-		})
+	asciiMode, fullShape, _ := ime.currentInputModeState()
+	aiEnabled := ime.productSettings.AIEnabled
+	idleEnabled := ime.productSettings.AIRunMode != aiRunModeResident
+	schemaLabel := "输入方案"
+	if current := ime.currentSchemaDisplayName(); current != "" {
+		schemaLabel += " · " + current
 	}
-	if len(menuSwitches) > 0 {
-		items = append(items, map[string]interface{}{"text": ""})
+	aiLabel := "本地 AI · 已关闭"
+	if aiEnabled {
+		aiLabel = "本地 AI · " + map[aiRunMode]string{
+			aiRunModeSmart:    "智能",
+			aiRunModeResident: "常驻",
+			aiRunModeManual:   "手动",
+		}[ime.productSettings.AIRunMode]
 	}
-	if len(schemeSetItems) > 0 {
-		schemeSetItems = append(schemeSetItems,
-			map[string]interface{}{"text": ""},
-			map[string]interface{}{"id": ID_DOWNLOAD_SCHEME_SET, "text": "下载方案集(&D)"},
-		)
-		items = append(items, map[string]interface{}{
-			"text":    "切换方案集",
-			"submenu": schemeSetItems,
-		})
+
+	return []map[string]interface{}{
+		{
+			"id":      ID_ASCII_MODE,
+			"text":    map[bool]string{true: "英文输入", false: "中文输入"}[asciiMode],
+			"checked": true,
+		},
+		{
+			"text":    schemaLabel,
+			"submenu": ime.schemaMenuItems(),
+		},
+		{"text": ""},
+		{
+			"text": aiLabel,
+			"submenu": []map[string]interface{}{
+				{"id": ID_AI_ENABLED, "text": "启用本地 AI", "checked": aiEnabled},
+				{"text": ""},
+				{"text": "运行模式", "enabled": aiEnabled, "submenu": []map[string]interface{}{
+					{"id": ID_AI_MODE_SMART, "text": "智能 · 按需启动", "checked": ime.productSettings.AIRunMode == aiRunModeSmart, "enabled": aiEnabled},
+					{"id": ID_AI_MODE_RESIDENT, "text": "常驻 · 响应最快", "checked": ime.productSettings.AIRunMode == aiRunModeResident, "enabled": aiEnabled},
+					{"id": ID_AI_MODE_MANUAL, "text": "手动 · 仅快捷键", "checked": ime.productSettings.AIRunMode == aiRunModeManual, "enabled": aiEnabled},
+				}},
+				{"text": "空闲退出", "enabled": aiEnabled && idleEnabled, "submenu": []map[string]interface{}{
+					{"id": ID_AI_IDLE_10, "text": "10 分钟", "checked": ime.productSettings.AIIdleExitMinutes == 10, "enabled": aiEnabled && idleEnabled},
+					{"id": ID_AI_IDLE_30, "text": "30 分钟", "checked": ime.productSettings.AIIdleExitMinutes == 30, "enabled": aiEnabled && idleEnabled},
+					{"id": ID_AI_IDLE_NEVER, "text": "永不退出", "checked": ime.productSettings.AIIdleExitMinutes == 0, "enabled": aiEnabled && idleEnabled},
+				}},
+				{"text": ""},
+				{"id": ID_OPEN_AI_CONFIG, "text": "AI 设置"},
+			},
+		},
+		{
+			"text": "个人词库",
+			"submenu": []map[string]interface{}{
+				{"id": ID_OPEN_CUSTOM_PHRASE, "text": "编辑自定义短语"},
+				{"id": ID_EXPORT_USER_DICT, "text": "导出词库快照"},
+				{"id": ID_IMPORT_USER_DICT, "text": "导入并合并快照"},
+				{"id": ID_SYNC_DIR, "text": "打开快照目录"},
+			},
+		},
+		{"text": ""},
+		{
+			"text": "设置与诊断",
+			"submenu": []map[string]interface{}{
+				{"id": ID_FULL_SHAPE, "text": "全角输入", "checked": fullShape},
+				{"id": ID_ASCII_PUNCT, "text": "英文标点", "checked": ime.backend != nil && ime.backend.GetOption("ascii_punct")},
+				{"id": ID_DEPLOY, "text": "重新部署输入方案"},
+				{"text": ""},
+				{"id": ID_USER_DIR, "text": "打开数据目录"},
+				{"id": ID_LOG_DIR, "text": "打开诊断日志"},
+			},
+		},
 	}
-	if len(schemaItems) > 0 {
-		items = append(items, map[string]interface{}{
-			"text":    "输入方案(&I)",
-			"submenu": schemaItems,
-		})
-	}
-	if len(schemeSetItems) > 0 || len(schemaItems) > 0 {
-		items = append(items,
-			map[string]interface{}{"id": ID_OPEN_CUSTOM_PHRASE, "text": "打开置顶短语"},
-			map[string]interface{}{"id": ID_OPEN_SUPER_ABBREV, "text": "打开超级简拼"},
-			map[string]interface{}{"id": ID_UPDATE_CONFIG, "text": "更新配置(&P)"},
-			map[string]interface{}{"id": ID_DEPLOY, "text": "刷新配置(&R)"},
-			map[string]interface{}{"text": ""},
-		)
-	}
-	items = append(items,
-		map[string]interface{}{"id": ID_SHARED_INPUT_STATE, "text": "输入状态共享", "checked": ime.inputStateShared},
-		map[string]interface{}{"text": "外观(&A)", "submenu": []map[string]interface{}{
-			{"text": "切换主题", "submenu": ime.themeMenuItems()},
-			{"id": ID_APPEARANCE_INLINE_PREEDIT, "text": "行内预编辑", "checked": ime.inlinePreeditEnabled()},
-			{"text": "候选排列", "submenu": []map[string]interface{}{
-				{"id": ID_APPEARANCE_LAYOUT_VERTICAL, "text": "竖排", "checked": !ime.isHorizontalCandidateLayout()},
-				{"id": ID_APPEARANCE_LAYOUT_HORIZONTAL, "text": "横排", "checked": ime.isHorizontalCandidateLayout()},
-			}},
-			{"text": "每行候选数", "enabled": ime.isHorizontalCandidateLayout(), "submenu": []map[string]interface{}{
-				{"id": ID_APPEARANCE_PER_ROW_3, "text": "3", "checked": ime.effectiveCandidatePerRow() == 3, "enabled": ime.isHorizontalCandidateLayout()},
-				{"id": ID_APPEARANCE_PER_ROW_5, "text": "5", "checked": ime.effectiveCandidatePerRow() == 5, "enabled": ime.isHorizontalCandidateLayout()},
-				{"id": ID_APPEARANCE_PER_ROW_7, "text": "7", "checked": ime.effectiveCandidatePerRow() == 7, "enabled": ime.isHorizontalCandidateLayout()},
-				{"id": ID_APPEARANCE_PER_ROW_9, "text": "9", "checked": ime.effectiveCandidatePerRow() == 9, "enabled": ime.isHorizontalCandidateLayout()},
-			}},
-			{"text": "候选间距", "submenu": []map[string]interface{}{
-				{"id": ID_APPEARANCE_SPACING_0, "text": "0", "checked": ime.style.CandidateSpacing == 0},
-				{"id": ID_APPEARANCE_SPACING_10, "text": "10", "checked": ime.style.CandidateSpacing == 10},
-				{"id": ID_APPEARANCE_SPACING_20, "text": "20", "checked": ime.style.CandidateSpacing == 20},
-				{"id": ID_APPEARANCE_SPACING_30, "text": "30", "checked": ime.style.CandidateSpacing == 30},
-				{"id": ID_APPEARANCE_SPACING_40, "text": "40", "checked": ime.style.CandidateSpacing == 40},
-				{"id": ID_APPEARANCE_SPACING_50, "text": "50", "checked": ime.style.CandidateSpacing == 50},
-			}},
-			{"text": "总候选数量", "submenu": []map[string]interface{}{
-				{"id": ID_APPEARANCE_CAND_COUNT_3, "text": "3", "checked": ime.candidateCount() == 3},
-				{"id": ID_APPEARANCE_CAND_COUNT_5, "text": "5", "checked": ime.candidateCount() == 5},
-				{"id": ID_APPEARANCE_CAND_COUNT_7, "text": "7", "checked": ime.candidateCount() == 7},
-				{"id": ID_APPEARANCE_CAND_COUNT_9, "text": "9", "checked": ime.candidateCount() == 9},
-			}},
-			{"text": "字体大小", "submenu": []map[string]interface{}{
-				{"id": ID_APPEARANCE_FONT_8, "text": "8", "checked": ime.style.FontPoint == 8},
-				{"id": ID_APPEARANCE_FONT_10, "text": "10", "checked": ime.style.FontPoint == 10},
-				{"id": ID_APPEARANCE_FONT_12, "text": "12", "checked": ime.style.FontPoint == 12},
-				{"id": ID_APPEARANCE_FONT_14, "text": "14", "checked": ime.style.FontPoint == 14},
-				{"id": ID_APPEARANCE_FONT_16, "text": "16", "checked": ime.style.FontPoint == 16},
-				{"id": ID_APPEARANCE_FONT_18, "text": "18", "checked": ime.style.FontPoint == 18},
-				{"id": ID_APPEARANCE_FONT_20, "text": "20", "checked": ime.style.FontPoint == 20},
-				{"id": ID_APPEARANCE_FONT_22, "text": "22", "checked": ime.style.FontPoint == 22},
-				{"id": ID_APPEARANCE_FONT_24, "text": "24", "checked": ime.style.FontPoint == 24},
-				{"id": ID_APPEARANCE_FONT_26, "text": "26", "checked": ime.style.FontPoint == 26},
-				{"id": ID_APPEARANCE_FONT_28, "text": "28", "checked": ime.style.FontPoint == 28},
-				{"id": ID_APPEARANCE_FONT_30, "text": "30", "checked": ime.style.FontPoint == 30},
-			}},
-			{"text": "候选文字字体", "submenu": []map[string]interface{}{
-				{"id": ID_APPEARANCE_FONT_FAMILY_SEGOE_UI, "text": "Segoe UI", "checked": strings.EqualFold(ime.style.FontFace, "Segoe UI")},
-				{"id": ID_APPEARANCE_FONT_FAMILY_YAHEI_UI, "text": "微软雅黑 UI", "checked": strings.EqualFold(ime.style.FontFace, "Microsoft YaHei UI")},
-				{"id": ID_APPEARANCE_FONT_FAMILY_DENGXIAN, "text": "等线", "checked": strings.EqualFold(ime.style.FontFace, "DengXian")},
-				{"id": ID_APPEARANCE_FONT_FAMILY_SIMSUN, "text": "宋体", "checked": strings.EqualFold(ime.style.FontFace, "SimSun")},
-			}},
-			{"text": "注释文字大小", "submenu": []map[string]interface{}{
-				{"id": ID_APPEARANCE_COMMENT_FONT_8, "text": "8", "checked": ime.style.CandidateCommentFontPoint == 8},
-				{"id": ID_APPEARANCE_COMMENT_FONT_10, "text": "10", "checked": ime.style.CandidateCommentFontPoint == 10},
-				{"id": ID_APPEARANCE_COMMENT_FONT_12, "text": "12", "checked": ime.style.CandidateCommentFontPoint == 12},
-				{"id": ID_APPEARANCE_COMMENT_FONT_14, "text": "14", "checked": ime.style.CandidateCommentFontPoint == 14},
-				{"id": ID_APPEARANCE_COMMENT_FONT_16, "text": "16", "checked": ime.style.CandidateCommentFontPoint == 16},
-				{"id": ID_APPEARANCE_COMMENT_FONT_18, "text": "18", "checked": ime.style.CandidateCommentFontPoint == 18},
-				{"id": ID_APPEARANCE_COMMENT_FONT_20, "text": "20", "checked": ime.style.CandidateCommentFontPoint == 20},
-				{"id": ID_APPEARANCE_COMMENT_FONT_22, "text": "22", "checked": ime.style.CandidateCommentFontPoint == 22},
-				{"id": ID_APPEARANCE_COMMENT_FONT_24, "text": "24", "checked": ime.style.CandidateCommentFontPoint == 24},
-				{"id": ID_APPEARANCE_COMMENT_FONT_26, "text": "26", "checked": ime.style.CandidateCommentFontPoint == 26},
-				{"id": ID_APPEARANCE_COMMENT_FONT_28, "text": "28", "checked": ime.style.CandidateCommentFontPoint == 28},
-				{"id": ID_APPEARANCE_COMMENT_FONT_30, "text": "30", "checked": ime.style.CandidateCommentFontPoint == 30},
-			}},
-			{"text": "注释文字字体", "submenu": []map[string]interface{}{
-				{"id": ID_APPEARANCE_COMMENT_FONT_FAMILY_CONSOLAS, "text": "Consolas", "checked": strings.EqualFold(ime.style.CandidateCommentFontFace, "Consolas")},
-				{"id": ID_APPEARANCE_COMMENT_FONT_FAMILY_YAHEI_UI, "text": "微软雅黑 UI", "checked": strings.EqualFold(ime.style.CandidateCommentFontFace, "Microsoft YaHei UI")},
-				{"id": ID_APPEARANCE_COMMENT_FONT_FAMILY_DENGXIAN, "text": "等线", "checked": strings.EqualFold(ime.style.CandidateCommentFontFace, "DengXian")},
-				{"id": ID_APPEARANCE_COMMENT_FONT_FAMILY_SIMSUN, "text": "宋体", "checked": strings.EqualFold(ime.style.CandidateCommentFontFace, "SimSun")},
-			}},
-			{"text": "候选框背景", "submenu": []map[string]interface{}{
-				{"id": ID_APPEARANCE_BG_WHITE, "text": "白色", "checked": strings.EqualFold(ime.style.CandidateBackgroundColor, "#ffffff")},
-				{"id": ID_APPEARANCE_BG_WARM, "text": "暖白", "checked": strings.EqualFold(ime.style.CandidateBackgroundColor, "#fff7e8")},
-				{"id": ID_APPEARANCE_BG_BLUE, "text": "浅蓝", "checked": strings.EqualFold(ime.style.CandidateBackgroundColor, "#f3f8ff")},
-			}},
-			{"text": "高亮颜色", "submenu": []map[string]interface{}{
-				{"id": ID_APPEARANCE_HL_BLUE, "text": "浅蓝", "checked": strings.EqualFold(ime.style.CandidateHighlightColor, "#c6ddf9")},
-				{"id": ID_APPEARANCE_HL_GRAY, "text": "浅灰", "checked": strings.EqualFold(ime.style.CandidateHighlightColor, "#e5e7eb")},
-				{"id": ID_APPEARANCE_HL_GREEN, "text": "浅绿", "checked": strings.EqualFold(ime.style.CandidateHighlightColor, "#d9f2e6")},
-			}},
-			{"text": "字体颜色", "submenu": []map[string]interface{}{
-				{"id": ID_APPEARANCE_TEXT_BLACK, "text": "黑色", "checked": strings.EqualFold(ime.style.CandidateTextColor, "#000000")},
-				{"id": ID_APPEARANCE_TEXT_DARKGRAY, "text": "深灰", "checked": strings.EqualFold(ime.style.CandidateTextColor, "#333333")},
-				{"id": ID_APPEARANCE_TEXT_BLUE, "text": "深蓝", "checked": strings.EqualFold(ime.style.CandidateTextColor, "#1d4ed8")},
-			}},
-			{"text": "高亮文字颜色", "submenu": []map[string]interface{}{
-				{"id": ID_APPEARANCE_HLTEXT_BLACK, "text": "黑色", "checked": strings.EqualFold(ime.style.CandidateHighlightTextColor, "#000000")},
-				{"id": ID_APPEARANCE_HLTEXT_WHITE, "text": "白色", "checked": strings.EqualFold(ime.style.CandidateHighlightTextColor, "#ffffff")},
-				{"id": ID_APPEARANCE_HLTEXT_BLUE, "text": "深蓝", "checked": strings.EqualFold(ime.style.CandidateHighlightTextColor, "#1d4ed8")},
-			}},
-			{"text": ""},
-			{"id": ID_APPEARANCE_IMPORT_SKIN, "text": "导入皮肤"},
-		}},
-		map[string]interface{}{"text": "输入设置", "submenu": []map[string]interface{}{
-			{"id": ID_INPUT_AUTO_PAIR_QUOTES, "text": "自动插入成对符号", "checked": ime.autoPairQuotes},
-			{"id": ID_OPEN_AUTO_PAIR_SYMBOLS, "text": "打开成对符号设置"},
-			{"id": ID_INPUT_SEMICOLON_SELECT_SECOND, "text": "分号键次选", "checked": ime.semicolonSelectSecond},
-		}},
-		ime.cloudClipboardMenuSection(),
-		map[string]interface{}{"text": "打开文件夹(&O)", "submenu": []map[string]interface{}{
-			{"id": ID_USER_DIR, "text": "用户文件夹"},
-			{"id": ID_SHARED_DIR, "text": "共享文件夹"},
-			{"id": ID_SYNC_DIR, "text": "同步文件夹"},
-			{"id": ID_LOG_DIR, "text": "日志文件夹"},
-		}},
-		map[string]interface{}{"text": ""},
-		map[string]interface{}{"id": ID_HELP_DOCS, "text": "帮助文档(&H)"},
-		map[string]interface{}{"id": ID_DISCUSSIONS, "text": "参加讨论(&J)"},
-	)
-	return items
 }
 
 func (ime *IME) AIHotkeyDescription() string {
@@ -3398,9 +3094,6 @@ func (ime *IME) AIHotkeyDescription() string {
 }
 
 func (ime *IME) sharedDir() string {
-	if sharedDir, _, ok := androidRimeDirs(); ok {
-		return sharedDir
-	}
 	exePath, err := os.Executable()
 	if err != nil {
 		return ""
@@ -3409,9 +3102,6 @@ func (ime *IME) sharedDir() string {
 }
 
 func (ime *IME) userDir() string {
-	if _, userDir, ok := androidRimeDirs(); ok {
-		return userDir
-	}
 	root := moqiAppDataDir()
 	if root == "" {
 		return ""

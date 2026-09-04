@@ -69,7 +69,9 @@ $windowsInstallScript = Join-Path $RepoRoot "scripts\install.ps1"
 $moqiImeRuntimeDir = Join-Path $MoqiImeRoot "scripts\build\moqi-ime"
 
 if (-not $ProtobufRoot) {
-    $candidatePaths = @()
+    $candidatePaths = @(
+        (Join-Path $RepoRoot "third_party\protoc-33.5-win64")
+    )
     $defaultRoot = "D:\a_dev\protoc-33.5-win64"
     if (Test-Path -LiteralPath $defaultRoot) {
         $candidatePaths += $defaultRoot
@@ -87,7 +89,9 @@ if (-not $ProtobufRoot) {
 }
 
 if (-not $ProtobufSourceDir) {
-    $candidatePaths = @()
+    $candidatePaths = @(
+        (Join-Path $RepoRoot "third_party\protobuf-33.5")
+    )
     if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
         $cacheRoot = Join-Path $env:USERPROFILE ".cache\moqi-protobuf"
         $candidatePaths += @(
@@ -137,7 +141,8 @@ Write-Host "== Step 2/3: Build moqi-im-windows binaries =="
     "-File", "`"$windowsBuildScript`"",
     "-RepoRoot", "`"$RepoRoot`"",
     "-Configuration", $Configuration,
-    "-Generator", "`"$Generator`""
+    "-Generator", "`"$Generator`"",
+    "-Clean"
 )
 if ($ProtobufSourceDir) {
     $windowsBuildArgs += @("-ProtobufSourceDir", "`"$ProtobufSourceDir`"")

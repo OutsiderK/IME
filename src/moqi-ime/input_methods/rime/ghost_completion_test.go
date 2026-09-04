@@ -1,12 +1,48 @@
 package rime
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gaboolic/moqi-ime/imecore"
 )
+
+func TestGhostCompletionRejectsRemoteEndpoint(t *testing.T) {
+	ime := newTestIME()
+	ime.productSettings.AIEnabled = true
+	ime.configureGhostCompletion(&aiRuntimeConfig{
+		API: aiAPIConfig{
+			BaseURL: "https://example.test/v1",
+			APIKey:  "unused",
+			Model:   "local-model",
+		},
+		Completion: aiCompletionConfig{Enabled: true},
+	})
+	if ime.ghostCompletionEnabled() {
+		t.Fatal("remote AI endpoint must not be enabled in the personal Windows edition")
+	}
+}
+
+func TestGhostCompletionAcceptsLoopbackEndpoint(t *testing.T) {
+	ime := newTestIME()
+	ime.productSettings.AIEnabled = true
+	ime.configureGhostCompletion(&aiRuntimeConfig{
+		API: aiAPIConfig{
+			BaseURL: "http://127.0.0.1:8080/v1",
+			APIKey:  "local",
+			Model:   "local-model",
+		},
+		Completion: aiCompletionConfig{Enabled: true},
+	})
+	if !ime.ghostCompletionEnabled() {
+		t.Fatal("loopback AI endpoint should be enabled")
+	}
+	if ime.ghostGenerator == nil {
+		t.Fatal("expected a completion generator for loopback AI")
+	}
+}
 
 func TestGhostCompletionF8ShowsThenAccepts(t *testing.T) {
 	ime := newTestIME()
@@ -42,25 +78,24 @@ func TestGhostCompletionF8ShowsThenAccepts(t *testing.T) {
 	}
 }
 
-func TestGhostCompletionRegistersAndHandlesF8AsPreservedKey(t *testing.T) {
+func TestGhostCompletionDoesNotRegisterUnsafeTsfPreservedKeys(t *testing.T) {
 	ime := newTestIME()
 	ime.ghostEnabled = true
 	ime.ghostReady = true
 	ime.ghostCandidates = []string{"苹果。", "橘子。"}
 
 	activate := ime.HandleRequest(&imecore.Request{Method: "onActivate", SeqNum: 1})
-	if len(activate.AddPreservedKey) != 3 {
-		t.Fatalf("expected three ghost preserved keys, got %#v", activate.AddPreservedKey)
+	if len(activate.AddPreservedKey) != 0 {
+		t.Fatalf("unsafe ghost preserved keys must stay disabled, got %#v", activate.AddPreservedKey)
 	}
-	key := activate.AddPreservedKey[0]
-	if key.KeyCode != uint32(vkF8) || key.Modifiers != 0 || key.GUID != ghostPreservedKeyGUID {
-		t.Fatalf("unexpected ghost preserved key: %#v", key)
+	wantRemoved := []string{
+		ghostPreservedKeyGUID,
+		ghostLongPreservedKeyGUID,
+		ghostNextPreservedKeyGUID,
 	}
-	if activate.AddPreservedKey[1].KeyCode != uint32(vkF8) || activate.AddPreservedKey[1].Modifiers != tsfModifierShift || activate.AddPreservedKey[1].GUID != ghostLongPreservedKeyGUID {
-		t.Fatalf("unexpected long ghost preserved key: %#v", activate.AddPreservedKey[1])
-	}
-	if activate.AddPreservedKey[2].KeyCode != uint32(vkF9) || activate.AddPreservedKey[2].GUID != ghostNextPreservedKeyGUID {
-		t.Fatalf("unexpected next-candidate preserved key: %#v", activate.AddPreservedKey[2])
+	if !reflect.DeepEqual(activate.RemovePreservedKey, wantRemoved) {
+		t.Fatalf("activation must remove all legacy preserved keys: got %#v, want %#v",
+			activate.RemovePreservedKey, wantRemoved)
 	}
 
 	show := ime.HandleRequest(&imecore.Request{
@@ -99,6 +134,9 @@ func TestGhostCompletionPreservedF8GeneratesFromFreshSurroundingText(t *testing.
 	if resp.ReturnValue != 1 {
 		t.Fatalf("expected on-demand F8 to be consumed, got %#v", resp)
 	}
+	if resp.ShowMessage != nil {
+		t.Fatalf("on-demand F8 must stay visually quiet during the first second, got %#v", resp.ShowMessage)
+	}
 
 	select {
 	case input := <-generated:
@@ -107,6 +145,135 @@ func TestGhostCompletionPreservedF8GeneratesFromFreshSurroundingText(t *testing.
 		}
 	case <-time.After(time.Second):
 		t.Fatal("on-demand F8 did not start completion")
+	}
+}
+
+func TestGhostCompletionOrdinaryF8GeneratesFromFreshSurroundingText(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.ghostEnabled = true
+	ime.ghostConfig = aiCompletionConfig{IdleMS: 450, ContextTokens: 128, CandidateCount: 3}
+	generated := make(chan aiCompletionRequest, 1)
+	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+		generated <- input
+		return []string{"苹果。"}, nil
+	}
+	t.Cleanup(ime.resetGhostCompletion)
+
+	f8 := &imecore.Request{
+		KeyCode:            vkF8,
+		KeyStates:          make(imecore.KeyStates, 256),
+		CloudClipboardText: ghostContextEnvelope + "我今天吃了一个" + "\x1f，然后去散步。",
+	}
+	filterResp := imecore.NewResponse(1, true)
+	if !ime.handleGhostKeyDownFilter(f8, filterResp) || filterResp.ReturnValue != 1 {
+		t.Fatalf("ordinary F8 must be claimed before a candidate exists, got %#v", filterResp)
+	}
+	resp := imecore.NewResponse(2, true)
+	if !ime.handleGhostKeyDown(f8, resp) || resp.ReturnValue != 1 {
+		t.Fatalf("ordinary on-demand F8 must be consumed, got %#v", resp)
+	}
+	if resp.ShowMessage != nil {
+		t.Fatalf("ordinary F8 must not show an eager loading message, got %#v", resp.ShowMessage)
+	}
+
+	select {
+	case input := <-generated:
+		if input.Context != "我今天吃了一个" || input.FollowingContext != "，然后去散步。" || input.Long {
+			t.Fatalf("unexpected ordinary F8 context: %#v", input)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ordinary on-demand F8 did not start completion")
+	}
+}
+
+func TestGhostCompletionFastResultSuppressesDelayedLoadingMessage(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.ghostEnabled = true
+	ime.ghostLoadingDelay = 40 * time.Millisecond
+	ime.ghostConfig = aiCompletionConfig{ContextTokens: 128, CandidateCount: 1}
+	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+		return []string{"，正好可以开始工作了。"}, nil
+	}
+	updates := make(chan *imecore.Response, 2)
+	ime.asyncResponseSender = func(resp *imecore.Response) { updates <- resp }
+	t.Cleanup(ime.resetGhostCompletion)
+
+	resp := ime.HandleRequest(&imecore.Request{
+		Method:             "onPreservedKey",
+		SeqNum:             1,
+		Data:               map[string]interface{}{"guid": ghostPreservedKeyGUID},
+		CloudClipboardText: ghostContextEnvelope + "现在一切正常了" + "\x1f",
+	})
+	if resp.ShowMessage != nil {
+		t.Fatalf("fast completion must not flash a loading message, got %#v", resp.ShowMessage)
+	}
+
+	select {
+	case update := <-updates:
+		if update.ShowMessage == nil || update.ShowMessage.Message != "，正好可以开始工作了。" {
+			t.Fatalf("expected completion as the first visible update, got %#v", update)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fast completion did not arrive")
+	}
+
+	time.Sleep(2 * ime.ghostLoadingDelay)
+	select {
+	case update := <-updates:
+		t.Fatalf("loading message leaked after a fast completion: %#v", update)
+	default:
+	}
+}
+
+func TestGhostCompletionShowsLoadingOnlyAfterDelay(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.ghostEnabled = true
+	ime.ghostLoadingDelay = 25 * time.Millisecond
+	ime.ghostConfig = aiCompletionConfig{ContextTokens: 128, CandidateCount: 1}
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+		started <- struct{}{}
+		<-release
+		return []string{"，正好可以开始工作了。"}, nil
+	}
+	updates := make(chan *imecore.Response, 3)
+	ime.asyncResponseSender = func(resp *imecore.Response) { updates <- resp }
+	t.Cleanup(ime.resetGhostCompletion)
+
+	resp := ime.HandleRequest(&imecore.Request{
+		Method:             "onPreservedKey",
+		SeqNum:             1,
+		Data:               map[string]interface{}{"guid": ghostPreservedKeyGUID},
+		CloudClipboardText: ghostContextEnvelope + "现在一切正常了" + "\x1f",
+	})
+	if resp.ShowMessage != nil {
+		t.Fatalf("loading must be delayed, got %#v", resp.ShowMessage)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("completion generator did not start")
+	}
+	select {
+	case update := <-updates:
+		if update.ShowMessage == nil || update.ShowMessage.Message != "本地 AI 正在准备…" {
+			t.Fatalf("expected delayed loading state, got %#v", update)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delayed loading message did not appear")
+	}
+
+	release <- struct{}{}
+	select {
+	case update := <-updates:
+		if update.ShowMessage == nil || update.ShowMessage.Message != "，正好可以开始工作了。" {
+			t.Fatalf("expected completion to replace loading state, got %#v", update)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("completion did not replace delayed loading state")
 	}
 }
 

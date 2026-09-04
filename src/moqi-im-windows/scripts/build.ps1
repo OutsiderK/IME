@@ -23,6 +23,10 @@
 
 .PARAMETER ProtobufSourceDir
   Optional local protobuf source tree passed to CMake as MOQI_PROTOBUF_SOURCE_DIR.
+
+.PARAMETER Clean
+  Remove both build directories before configuring. Use this for release packages
+  so binaries cannot contain stale object files from an earlier header layout.
 #>
 param(
   [string] $RepoRoot = "",
@@ -31,7 +35,8 @@ param(
   [string] $Configuration = "Release",
   [string] $Generator = "Visual Studio 17 2022",
   [string] $ProtobufRoot = "",
-  [string] $ProtobufSourceDir = ""
+  [string] $ProtobufSourceDir = "",
+  [switch] $Clean
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,6 +54,51 @@ function Invoke-Step {
   }
 }
 
+function Invoke-CMakeConfigure {
+  param(
+    [string[]] $ArgumentList,
+    [string] $BuildDir
+  )
+
+  # On affected Windows hosts, probing C and C++ against the same cache can
+  # crash CMake. Probe C in the real build tree and C++ in a temporary sibling,
+  # then reuse the generated compiler description for the full configuration.
+  Invoke-Step -FilePath "cmake" -ArgumentList ($ArgumentList + "-DMOQI_BOOTSTRAP_LANGUAGE=C")
+
+  $cxxBuildDir = "${BuildDir}-compiler-cxx"
+  if (Test-Path -LiteralPath $cxxBuildDir) {
+    Remove-Item -LiteralPath $cxxBuildDir -Recurse -Force
+  }
+  $cxxArguments = [System.Collections.Generic.List[string]]::new()
+  for ($index = 0; $index -lt $ArgumentList.Count; $index++) {
+    if ($ArgumentList[$index] -eq "-B") {
+      $cxxArguments.Add("-B")
+      $cxxArguments.Add($cxxBuildDir)
+      $index++
+    }
+    else {
+      $cxxArguments.Add($ArgumentList[$index])
+    }
+  }
+  Invoke-Step -FilePath "cmake" -ArgumentList ($cxxArguments.ToArray() + "-DMOQI_BOOTSTRAP_LANGUAGE=CXX")
+
+  $cxxCompilerFile = Get-ChildItem -LiteralPath (Join-Path $cxxBuildDir "CMakeFiles") -Filter "CMakeCXXCompiler.cmake" -File -Recurse |
+    Select-Object -First 1
+  $cCompilerFile = Get-ChildItem -LiteralPath (Join-Path $BuildDir "CMakeFiles") -Filter "CMakeCCompiler.cmake" -File -Recurse |
+    Select-Object -First 1
+  if (-not $cxxCompilerFile -or -not $cCompilerFile) {
+    throw "CMake compiler bootstrap did not produce the expected compiler descriptions."
+  }
+  $platformInfoDir = Split-Path -Parent $cCompilerFile.FullName
+  Copy-Item -LiteralPath $cxxCompilerFile.FullName -Destination $platformInfoDir -Force
+  $cxxAbiFile = Join-Path $cxxCompilerFile.DirectoryName "CMakeDetermineCompilerABI_CXX.bin"
+  if (Test-Path -LiteralPath $cxxAbiFile) {
+    Copy-Item -LiteralPath $cxxAbiFile -Destination $platformInfoDir -Force
+  }
+
+  Invoke-Step -FilePath "cmake" -ArgumentList ($ArgumentList + "-DMOQI_BOOTSTRAP_LANGUAGE=")
+}
+
 function Resolve-ProtobufSourceDir {
   param(
     [string] $RequestedPath,
@@ -62,6 +112,7 @@ function Resolve-ProtobufSourceDir {
   if (-not [string]::IsNullOrWhiteSpace($env:MOQI_PROTOBUF_SOURCE_DIR)) {
     $candidates += $env:MOQI_PROTOBUF_SOURCE_DIR
   }
+  $candidates += (Join-Path $RepoRoot "third_party\protobuf-33.5")
   if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
     $cacheRoot = Join-Path $env:USERPROFILE ".cache\moqi-protobuf"
     $candidates += @(
@@ -86,7 +137,8 @@ function Resolve-ProtobufSourceDir {
 
 function Resolve-ProtobufRoot {
   param(
-    [string] $RequestedPath
+    [string] $RequestedPath,
+    [string] $RepoRoot
   )
 
   $candidates = @()
@@ -96,6 +148,7 @@ function Resolve-ProtobufRoot {
   if (-not [string]::IsNullOrWhiteSpace($env:MOQI_PROTOBUF_ROOT)) {
     $candidates += $env:MOQI_PROTOBUF_ROOT
   }
+  $candidates += (Join-Path $RepoRoot "third_party\protoc-33.5-win64")
   $defaultRoot = "D:\a_dev\protoc-33.5-win64"
   if (Test-Path -LiteralPath $defaultRoot) {
     $candidates += $defaultRoot
@@ -123,8 +176,27 @@ if (-not $Win32BuildDir) { $Win32BuildDir = Join-Path $RepoRoot "build-vs32" }
 if (-not $X64BuildDir) { $X64BuildDir = Join-Path $RepoRoot "build-vs64" }
 $Win32BuildDir = [System.IO.Path]::GetFullPath($Win32BuildDir)
 $X64BuildDir = [System.IO.Path]::GetFullPath($X64BuildDir)
-$ProtobufRoot = Resolve-ProtobufRoot -RequestedPath $ProtobufRoot
+$ProtobufRoot = Resolve-ProtobufRoot -RequestedPath $ProtobufRoot -RepoRoot $RepoRoot
 $ProtobufSourceDir = Resolve-ProtobufSourceDir -RequestedPath $ProtobufSourceDir -RepoRoot $RepoRoot
+
+if ($Clean) {
+  foreach ($buildDir in @($Win32BuildDir, $X64BuildDir)) {
+    $pathRoot = [System.IO.Path]::GetPathRoot($buildDir)
+    if ($buildDir -eq $pathRoot -or $buildDir -eq $RepoRoot) {
+      throw "Refusing to clean unsafe build directory: $buildDir"
+    }
+    if (Test-Path -LiteralPath $buildDir) {
+      Write-Host "[CLEAN] Removing build directory: $buildDir"
+      Remove-Item -LiteralPath $buildDir -Recurse -Force
+    }
+  }
+}
+
+# Ninja parses MSVC /showIncludes output by a localized text prefix. Keeping the
+# compiler diagnostics in English prevents non-ASCII code-page conversion from
+# silently dropping header dependencies and reusing ABI-incompatible objects.
+$previousVsLang = $env:VSLANG
+$env:VSLANG = "1033"
 
 $commonConfigureArgs = @("-S", $RepoRoot)
 if (-not [string]::IsNullOrWhiteSpace($ProtobufRoot)) {
@@ -150,17 +222,23 @@ $x64ConfigureArgs = $commonConfigureArgs + @(
   "-A", "x64"
 )
 
-Invoke-Step -FilePath "cmake" -ArgumentList $win32ConfigureArgs
-Invoke-Step -FilePath "cmake" -ArgumentList @(
-  "--build", $Win32BuildDir,
-  "--config", $Configuration
-)
+try {
+  Invoke-CMakeConfigure -ArgumentList $win32ConfigureArgs -BuildDir $Win32BuildDir
+  Invoke-Step -FilePath "cmake" -ArgumentList @(
+    "--build", $Win32BuildDir,
+    "--config", $Configuration,
+    "--target", "MoqiTextService", "MoqiLauncher", "SetupHelper"
+  )
 
-Invoke-Step -FilePath "cmake" -ArgumentList $x64ConfigureArgs
-Invoke-Step -FilePath "cmake" -ArgumentList @(
-  "--build", $X64BuildDir,
-  "--config", $Configuration,
-  "--target", "MoqiTextService"
-)
+  Invoke-CMakeConfigure -ArgumentList $x64ConfigureArgs -BuildDir $X64BuildDir
+  Invoke-Step -FilePath "cmake" -ArgumentList @(
+    "--build", $X64BuildDir,
+    "--config", $Configuration,
+    "--target", "MoqiTextService"
+  )
+}
+finally {
+  $env:VSLANG = $previousVsLang
+}
 
-Write-Host "OK: Win32 $Configuration (full solution), x64 $Configuration (MoqiTextService)."
+Write-Host "OK: Win32 $Configuration (runtime targets), x64 $Configuration (MoqiTextService)."

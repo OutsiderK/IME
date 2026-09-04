@@ -19,13 +19,32 @@
 
 namespace {
 
-constexpr COLORREF kWindowBackground = RGB(255, 255, 255);
-constexpr COLORREF kWindowBorder = RGB(150, 150, 150);
-constexpr COLORREF kDividerColor = RGB(220, 220, 220);
-constexpr COLORREF kItemText = RGB(0, 0, 0);
-constexpr COLORREF kSelectedBackground = RGB(198, 221, 249);
-constexpr COLORREF kSelectedText = RGB(0, 0, 0);
-constexpr int kDefaultCandidateSpacing = 20;
+// Still Current / mist-shore semantic colors. The backend may update surface
+// colors for high contrast, while structure and focus remain consistent.
+constexpr COLORREF kWindowBackground = RGB(252, 253, 251);
+constexpr COLORREF kWindowBorder = RGB(213, 222, 221);
+constexpr COLORREF kDividerColor = RGB(226, 232, 230);
+constexpr COLORREF kItemText = RGB(20, 42, 56);
+constexpr COLORREF kMutedText = RGB(96, 116, 123);
+constexpr COLORREF kSelectedBackground = RGB(227, 237, 240);
+constexpr COLORREF kSelectedText = RGB(20, 42, 56);
+constexpr COLORREF kFocusAccent = RGB(194, 85, 44);
+// Legacy quiet-space floor. The final three-character reservation is derived
+// from the measured glyph width below so it remains correct across DPI/font.
+constexpr int kDefaultCandidateSpacing = 34;
+constexpr int kPreviousCandidateFontTimes2 = 29;
+constexpr int kCurrentCandidateFontTimes2 = 32;
+
+int scaleCandidateMetric(int value, UINT dpi) {
+    if (value <= 0) {
+        return 0;
+    }
+    dpi = dpi == 0 ? 96 : dpi;
+    return (std::max)(1, ::MulDiv(
+        value * kCurrentCandidateFontTimes2,
+        static_cast<int>(dpi),
+        96 * kPreviousCandidateFontTimes2));
+}
 
 std::wstring currentProcessPath() {
     std::wstring buffer(MAX_PATH, L'\0');
@@ -212,6 +231,22 @@ HWND resolveCandidateOwnerWindow(Ime::EditSession* session) {
     return hwnd;
 }
 
+UINT windowDpi(HWND hwnd) {
+	using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+	HMODULE user32 = ::GetModuleHandleW(L"user32.dll");
+	auto getDpiForWindow = reinterpret_cast<GetDpiForWindowFn>(
+		user32 ? ::GetProcAddress(user32, "GetDpiForWindow") : nullptr);
+	if (getDpiForWindow && hwnd) {
+		return getDpiForWindow(hwnd);
+	}
+	HDC screen = ::GetDC(nullptr);
+	const UINT dpi = screen ? static_cast<UINT>(::GetDeviceCaps(screen, LOGPIXELSX)) : 96;
+	if (screen) {
+		::ReleaseDC(nullptr, screen);
+	}
+	return dpi == 0 ? 96 : dpi;
+}
+
 } // namespace
 
 namespace Moqi {
@@ -219,6 +254,7 @@ namespace Moqi {
 CandidateWindow::CandidateWindow(Ime::TextService* service, Ime::EditSession* session)
     : Ime::ImeWindow(service),
       shown_(false),
+	  dpi_(96),
       selKeyWidth_(0),
       textWidth_(0),
       commentWidth_(0),
@@ -227,35 +263,40 @@ CandidateWindow::CandidateWindow(Ime::TextService* service, Ime::EditSession* se
       candSpacing_(kDefaultCandidateSpacing),
       colSpacing_(0),
       rowSpacing_(0),
-      padX_(service->isImmersive() ? 10 : 7),
-      padY_(service->isImmersive() ? 6 : 3),
-      labelGap_(6),
-      commentGap_(8),
-      borderWidth_(1),
-      borderRadius_(4),
-      minWidth_(200),
-      preeditHeight_(0),
-      preeditGap_(8),
+	  padX_(9),
+	  padY_(4),
+	  labelGap_(5),
+	  commentGap_(6),
+	  borderWidth_(1),
+	  borderRadius_(7),
+	  minWidth_(120),
+	  reservedCandidateTextWidth_(0),
+	  stableWidth_(0),
+	  maximumWidth_(0),
+	  preeditHeight_(0),
+	  preeditGap_(6),
       contentTop_(0),
       backgroundColor_(kWindowBackground),
       highlightColor_(kSelectedBackground),
       textColor_(kItemText),
       highlightTextColor_(kSelectedText),
-      commentColor_(kItemText),
-      commentHighlightColor_(kSelectedText),
+      commentColor_(kMutedText),
+      commentHighlightColor_(kMutedText),
       preeditCursor_(0),
       currentSel_(0),
       pressedSel_(-1),
       draggingWindow_(false),
       trackingMouse_(false),
       useCursor_(false),
-      commentFont_(nullptr) {
+      commentFont_(nullptr),
+      stableLayoutActive_(false) {
     margin_ = 0;
 
     const HWND rawOwner = resolveCandidateOwnerWindow(session);
     const HWND owner = normalizeCandidateOwnerWindow(rawOwner, service->isImmersive(), L"ctor");
     create(owner, WS_POPUP | WS_CLIPCHILDREN,
            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE);
+	updateMetricsForDpi(windowDpi(hwnd_));
 
     std::wostringstream log;
     log << L"[CandidateWindow::ctor] hwnd=" << hwnd_
@@ -272,7 +313,7 @@ STDMETHODIMP CandidateWindow::GetDescription(BSTR* pbstrDescription) {
     if (!pbstrDescription) {
         return E_INVALIDARG;
     }
-    *pbstrDescription = SysAllocString(L"Moqi candidate window");
+    *pbstrDescription = SysAllocString(L"书无墨候选窗");
     return S_OK;
 }
 
@@ -285,7 +326,9 @@ STDMETHODIMP CandidateWindow::GetGUID(GUID* pguid) {
 }
 
 STDMETHODIMP CandidateWindow::Show(BOOL bShow) {
-    shown_ = bShow;
+    const bool shouldShow = bShow != FALSE;
+    const bool visibilityChanged = shown_ != shouldShow;
+    shown_ = shouldShow;
     {
         std::wostringstream log;
         log << L"[CandidateWindow::Show] bShow=" << bShow
@@ -295,9 +338,11 @@ STDMETHODIMP CandidateWindow::Show(BOOL bShow) {
         appendCandidateWindowLog(log.str());
     }
     if (shown_) {
-        show();
-        enforceCandidateWindowTopmost(hwnd_, true, L"Show(TRUE)");
-    } else {
+        if (visibilityChanged || !isVisible()) {
+            show();
+            enforceCandidateWindowTopmost(hwnd_, true, L"Show(TRUE)");
+        }
+    } else if (visibilityChanged || isVisible()) {
         hide();
         logCandidateWindowState(L"[CandidateWindow::hide.state]", hwnd_);
     }
@@ -411,7 +456,7 @@ void CandidateWindow::setCandPerRow(int n) {
 }
 
 void CandidateWindow::setCandSpacing(int spacing) {
-    spacing = (std::max)(0, spacing);
+    spacing = scaleCandidateMetric((std::max)(0, spacing), dpi_);
     if (candSpacing_ != spacing) {
         candSpacing_ = spacing;
         recalculateSize();
@@ -430,11 +475,32 @@ void CandidateWindow::setCurrentSel(int sel) {
         sel = 0;
     }
     if (currentSel_ != sel) {
+        const int previousSel = currentSel_;
         currentSel_ = sel;
         if (isVisible()) {
-            ::InvalidateRect(hwnd_, NULL, TRUE);
+            RECT dirty = {};
+            RECT previousRect = {};
+            RECT currentRect = {};
+            itemRect(previousSel, previousRect);
+            itemRect(currentSel_, currentRect);
+            ::UnionRect(&dirty, &previousRect, &currentRect);
+            ::InvalidateRect(hwnd_, &dirty, FALSE);
         }
     }
+}
+
+void CandidateWindow::beginStableLayout() {
+    if (!stableLayoutActive_) {
+        stableLayoutActive_ = true;
+        stableWidth_ = 0;
+        stableItemWidths_.clear();
+    }
+}
+
+void CandidateWindow::endStableLayout() {
+    stableLayoutActive_ = false;
+    stableWidth_ = 0;
+    stableItemWidths_.clear();
 }
 
 void CandidateWindow::setUseCursor(bool use) {
@@ -563,7 +629,7 @@ void CandidateWindow::syncOwner(Ime::EditSession* session) {
         ownerUpdated = ownerError == 0;
     }
 
-    if (shown_) {
+    if (shown_ && ownerUpdated) {
         enforceCandidateWindowTopmost(hwnd_, true, L"syncOwner");
     }
 
@@ -613,6 +679,15 @@ void CandidateWindow::recalculateSize() {
     HGDIOBJ oldFont = ::SelectObject(hdc, font_);
     TEXTMETRICW metrics = {};
     TEXTMETRICW commentMetrics = {};
+    SIZE ideographSize = {};
+    ::GetTextExtentPoint32W(hdc, L"书", 1, &ideographSize);
+    // Reserve 3.4 measured Han glyphs. Unlike a fixed pixel guess, this leaves
+    // about 0.4 character after a three-character candidate at every DPI.
+    // A larger user spacing setting may still extend the reservation.
+    const int threeCharacterComfortWidth = ::MulDiv(ideographSize.cx, 34, 10);
+    reservedCandidateTextWidth_ = (std::max)(
+        threeCharacterComfortWidth,
+        static_cast<int>(ideographSize.cx) + candSpacing_);
     for (int i = 0, n = static_cast<int>(items_.size()); i < n; ++i) {
         SIZE selKeySize = {};
         wchar_t selKey[] = L"?.";
@@ -665,9 +740,18 @@ void CandidateWindow::recalculateSize() {
     for (int i = 0, n = static_cast<int>(items_.size()); i < n; ++i) {
         const int commentSectionWidth =
             itemCommentWidths_[i] > 0 ? commentGap_ + itemCommentWidths_[i] : 0;
-        const int trailingGap = candPerRow_ > 1 ? candSpacing_ : 0;
-        itemWidths_[i] = selKeyWidth_ + labelGap_ + itemTextWidths_[i] +
-                         commentSectionWidth + trailingGap;
+        const int candidateContentWidth = itemTextWidths_[i] + commentSectionWidth;
+        itemWidths_[i] = selKeyWidth_ + labelGap_ +
+                         (std::max)(reservedCandidateTextWidth_, candidateContentWidth);
+    }
+    if (stableLayoutActive_) {
+        if (stableItemWidths_.size() < itemWidths_.size()) {
+            stableItemWidths_.resize(itemWidths_.size(), 0);
+        }
+        for (size_t i = 0; i < itemWidths_.size(); ++i) {
+            stableItemWidths_[i] = (std::max)(stableItemWidths_[i], itemWidths_[i]);
+            itemWidths_[i] = stableItemWidths_[i];
+        }
     }
 
     const int rows = (static_cast<int>(items_.size()) + itemsPerRow - 1) / itemsPerRow;
@@ -685,7 +769,14 @@ void CandidateWindow::recalculateSize() {
         candidateContentWidth = (std::max)(candidateContentWidth, rowWidth);
     }
     const int contentWidth = (std::max)(candidateContentWidth, preeditWidth);
-    const int width = (std::max)(minWidth_, padX_ * 2 + contentWidth) + borderWidth_ * 2;
+    int width = (std::max)(minWidth_, padX_ * 2 + contentWidth) + borderWidth_ * 2;
+    if (stableLayoutActive_) {
+        stableWidth_ = (std::max)(stableWidth_, width);
+        width = stableWidth_;
+    }
+    if (maximumWidth_ > 0) {
+        width = (std::min)(width, maximumWidth_);
+    }
     int contentHeight = rows * itemHeight_ + (std::max)(0, rows - 1) * rowSpacing_;
     if (!preedit_.empty()) {
         contentTop_ = borderWidth_ + padY_ + preeditHeight_ + preeditGap_;
@@ -702,6 +793,17 @@ void CandidateWindow::recalculateSize() {
         << L" width=" << width << L" height=" << height
         << L" perRow=" << candPerRow_;
     appendCandidateWindowLog(log.str());
+}
+
+void CandidateWindow::setMaximumWidth(int width) {
+    maximumWidth_ = (std::max)(1, width);
+    int currentWidth = 0;
+    int currentHeight = 0;
+    size(&currentWidth, &currentHeight);
+    if (currentWidth > maximumWidth_) {
+        resize(maximumWidth_, currentHeight);
+        applyWindowShape();
+    }
 }
 
 LRESULT CandidateWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
@@ -726,6 +828,12 @@ LRESULT CandidateWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL:
         onMouseWheel(wp, lp);
         return 0;
+	case WM_DPICHANGED: {
+		updateMetricsForDpi(HIWORD(wp));
+		recalculateSize();
+		::InvalidateRect(hwnd_, nullptr, TRUE);
+		return 0;
+	}
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
     default:
@@ -791,7 +899,10 @@ void CandidateWindow::onPaint() {
         }
     }
 
-    ::BitBlt(hdc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, memdc, 0, 0, SRCCOPY);
+    const RECT& dirty = ps.rcPaint;
+    ::BitBlt(hdc, dirty.left, dirty.top,
+             dirty.right - dirty.left, dirty.bottom - dirty.top,
+             memdc, dirty.left, dirty.top, SRCCOPY);
 
     ::DeleteObject(windowRgn);
     ::DeleteObject(borderBrush);
@@ -819,7 +930,7 @@ void CandidateWindow::paintItem(HDC hdc, int index, int x, int y) {
 
     const COLORREF bgColor = selected ? highlightColor_ : backgroundColor_;
     const COLORREF textColor = selected ? highlightTextColor_ : textColor_;
-    const COLORREF selColor = selected ? highlightTextColor_ : textColor_;
+    const COLORREF selColor = selected ? kFocusAccent : kMutedText;
     const COLORREF commentColor = selected ? commentHighlightColor_ : commentColor_;
 
     if (selected) {
@@ -830,8 +941,34 @@ void CandidateWindow::paintItem(HDC hdc, int index, int x, int y) {
             highlightRc.right = clientRc.right - borderWidth_ - padX_;
         }
         HBRUSH highlightBrush = ::CreateSolidBrush(bgColor);
-        ::FillRect(hdc, &highlightRc, highlightBrush);
+        const int highlightRadius = scaleCandidateMetric(8, dpi_);
+        HRGN highlightRgn = ::CreateRoundRectRgn(
+            highlightRc.left, highlightRc.top,
+            highlightRc.right + 1, highlightRc.bottom + 1,
+            highlightRadius, highlightRadius);
+        ::FillRgn(hdc, highlightRgn, highlightBrush);
+        ::DeleteObject(highlightRgn);
         ::DeleteObject(highlightBrush);
+
+
+        HPEN accentPen = ::CreatePen(
+            PS_SOLID, scaleCandidateMetric(2, dpi_), kFocusAccent);
+        HGDIOBJ oldPen = ::SelectObject(hdc, accentPen);
+        const int accentInset = scaleCandidateMetric(3, dpi_);
+        const int accentBottom = scaleCandidateMetric(1, dpi_);
+        if (candPerRow_ == 1) {
+            ::MoveToEx(hdc, highlightRc.left,
+                       highlightRc.top + accentInset, nullptr);
+            ::LineTo(hdc, highlightRc.left,
+                     highlightRc.bottom - accentInset);
+        } else {
+            ::MoveToEx(hdc, highlightRc.left + accentInset,
+                       highlightRc.bottom - accentBottom, nullptr);
+            ::LineTo(hdc, highlightRc.right - accentInset,
+                     highlightRc.bottom - accentBottom);
+        }
+        ::SelectObject(hdc, oldPen);
+        ::DeleteObject(accentPen);
     }
 
     wchar_t selKey[] = L"?.";
@@ -871,7 +1008,7 @@ void CandidateWindow::paintPreeditCursor(HDC hdc, const RECT& preeditRc) {
         preeditRc.top + 1,
         cursorX + cursorWidth,
         preeditRc.bottom - 1};
-    HBRUSH cursorBrush = ::CreateSolidBrush(textColor_);
+    HBRUSH cursorBrush = ::CreateSolidBrush(kFocusAccent);
     ::FillRect(hdc, &cursorRc, cursorBrush);
     ::DeleteObject(cursorBrush);
 }
@@ -984,8 +1121,8 @@ int CandidateWindow::itemWidth(int index) const {
         return itemWidths_[index];
     }
     const int commentSectionWidth = commentWidth_ > 0 ? commentGap_ + commentWidth_ : 0;
-    const int trailingGap = candPerRow_ > 1 ? candSpacing_ : 0;
-    return selKeyWidth_ + labelGap_ + textWidth_ + commentSectionWidth + trailingGap;
+    return selKeyWidth_ + labelGap_ +
+           (std::max)(reservedCandidateTextWidth_, textWidth_ + commentSectionWidth);
 }
 
 int CandidateWindow::itemTextWidth(int index) const {
@@ -1017,6 +1154,19 @@ void CandidateWindow::applyWindowShape() {
         rc.left, rc.top, rc.right + 1, rc.bottom + 1,
         borderRadius_ * 2, borderRadius_ * 2);
     ::SetWindowRgn(hwnd_, region, TRUE);
+}
+
+void CandidateWindow::updateMetricsForDpi(UINT dpi) {
+	dpi_ = dpi == 0 ? 96 : dpi;
+	padX_ = scaleCandidateMetric(9, dpi_);
+	padY_ = scaleCandidateMetric(4, dpi_);
+	labelGap_ = scaleCandidateMetric(5, dpi_);
+	commentGap_ = scaleCandidateMetric(6, dpi_);
+	borderWidth_ = scaleCandidateMetric(1, dpi_);
+	borderRadius_ = scaleCandidateMetric(7, dpi_);
+	minWidth_ = scaleCandidateMetric(120, dpi_);
+	preeditGap_ = scaleCandidateMetric(6, dpi_);
+	candSpacing_ = scaleCandidateMetric(kDefaultCandidateSpacing, dpi_);
 }
 
 } // namespace Moqi

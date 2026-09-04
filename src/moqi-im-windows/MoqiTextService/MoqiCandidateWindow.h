@@ -72,6 +72,9 @@ public:
     void setCommentColor(COLORREF color);
     void setCommentHighlightColor(COLORREF color);
     void syncOwner(Ime::EditSession* session);
+    void beginStableLayout();
+    void endStableLayout();
+    void setMaximumWidth(int width);
     void recalculateSize() override;
 
 protected:
@@ -94,9 +97,11 @@ private:
     void onMouseWheel(WPARAM wp, LPARAM lp);
     void paintPreeditCursor(HDC hdc, const RECT& preeditRc);
     void applyWindowShape();
+	void updateMetricsForDpi(UINT dpi);
 
 private:
     BOOL shown_;
+	UINT dpi_;
     int selKeyWidth_;
     int textWidth_;
     int commentWidth_;
@@ -112,6 +117,9 @@ private:
     int borderWidth_;
     int borderRadius_;
     int minWidth_;
+    int reservedCandidateTextWidth_;
+    int stableWidth_;
+    int maximumWidth_;
     int preeditHeight_;
     int preeditGap_;
     int contentTop_;
@@ -129,11 +137,13 @@ private:
     std::vector<int> itemTextWidths_;
     std::vector<int> itemCommentWidths_;
     std::vector<int> itemWidths_;
+    std::vector<int> stableItemWidths_;
     int currentSel_;
     int pressedSel_;
     bool draggingWindow_;
     bool trackingMouse_;
     bool useCursor_;
+    bool stableLayoutActive_;
 };
 
 } // namespace Moqi

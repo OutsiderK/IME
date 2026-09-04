@@ -41,7 +41,7 @@ func TestProbeSentenceCandidates(t *testing.T) {
 		t.Fatalf("installed data dir missing: %q", installedDataDir)
 	}
 	if info, err := os.Stat(userDir); err != nil || !info.IsDir() {
-		t.Fatalf("user dir missing: %q", userDir)
+		t.Skipf("developer Rime data unavailable: %q", userDir)
 	}
 
 	probeRoot, err := os.MkdirTemp("", "moqi-rime-probe-*")

@@ -24,7 +24,14 @@
 namespace Ime {
 
 MessageWindow::MessageWindow(TextService* service, EditSession* session):
-    ImeWindow(service), ghostStyle_(false) {
+    ImeWindow(service),
+    ghostStyle_(false),
+    ghostTextColor_(RGB(96, 116, 123)),
+    ghostBackgroundColor_(RGB(252, 253, 251)),
+    ghostBorderColor_(RGB(213, 222, 221)),
+    ghostPaddingX_(8),
+    ghostPaddingY_(2),
+    ghostRadius_(7) {
 
     HWND parent = service->compositionWindow(session);
     create(parent, WS_POPUP|WS_CLIPCHILDREN, WS_EX_TOOLWINDOW|WS_EX_TOPMOST);
@@ -37,18 +44,26 @@ void MessageWindow::setGhostStyle(bool enabled) {
     }
     LONG_PTR exStyle = ::GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
     if (enabled) {
-        exStyle |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
-        margin_ = 1;
+        exStyle |= WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+        exStyle &= ~WS_EX_LAYERED;
+		margin_ = 0;
     }
     else {
-        exStyle &= ~(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+        exStyle &= ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+		margin_ = isImmersive() ? 10 : 5;
     }
     ::SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, exStyle);
-    if (enabled) {
-        ::SetLayeredWindowAttributes(hwnd_, RGB(1, 2, 3), 0, LWA_COLORKEY);
-    }
     recalculateSize();
     ::InvalidateRect(hwnd_, NULL, TRUE);
+}
+
+void MessageWindow::setGhostAppearance(COLORREF textColor, COLORREF backgroundColor, COLORREF borderColor) {
+	ghostTextColor_ = textColor;
+	ghostBackgroundColor_ = backgroundColor;
+	ghostBorderColor_ = borderColor;
+	if (hwnd_) {
+		::InvalidateRect(hwnd_, NULL, TRUE);
+	}
 }
 
 MessageWindow::~MessageWindow(void) {
@@ -63,8 +78,19 @@ void MessageWindow::recalculateSize() {
     SelectObject(dc, old_font);
     ReleaseDC(hwnd_, dc);
 
-    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0,
-        size.cx + margin_ * 2, size.cy + margin_ * 2, SWP_NOACTIVATE|SWP_NOMOVE);
+	const int width = size.cx + (ghostStyle_ ? ghostPaddingX_ * 2 : margin_ * 2);
+	const int height = size.cy + (ghostStyle_ ? ghostPaddingY_ * 2 : margin_ * 2);
+    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, width, height, SWP_NOACTIVATE|SWP_NOMOVE);
+	if (ghostStyle_) {
+		HRGN region = ::CreateRoundRectRgn(0, 0, width + 1, height + 1,
+			ghostRadius_ * 2, ghostRadius_ * 2);
+		if (region && !::SetWindowRgn(hwnd_, region, TRUE)) {
+			::DeleteObject(region);
+		}
+	}
+	else {
+		::SetWindowRgn(hwnd_, NULL, TRUE);
+	}
 }
 
 void MessageWindow::setText(std::wstring text) {
@@ -86,6 +112,11 @@ LRESULT MessageWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
+	case WM_ERASEBKGND:
+		if (ghostStyle_) {
+			return 1;
+		}
+		break;
     default:
         return ImeWindow::wndProc(msg, wp, lp);
     }
@@ -104,10 +135,18 @@ void MessageWindow::onPaint(PAINTSTRUCT& ps) {
 
     SetBkMode(hDC, TRANSPARENT);
     if (ghostStyle_) {
-        const COLORREF transparentKey = RGB(1, 2, 3);
-        ::FillSolidRect(hDC, &rc, transparentKey);
-        SetTextColor(hDC, RGB(128, 128, 128));
-        SetBkColor(hDC, transparentKey);
+		HBRUSH backgroundBrush = ::CreateSolidBrush(ghostBackgroundColor_);
+		HPEN borderPen = ::CreatePen(PS_SOLID, 1, ghostBorderColor_);
+		HGDIOBJ oldBrush = ::SelectObject(hDC, backgroundBrush);
+		HGDIOBJ oldPen = ::SelectObject(hDC, borderPen);
+		::RoundRect(hDC, rc.left, rc.top, rc.right, rc.bottom,
+			ghostRadius_ * 2, ghostRadius_ * 2);
+		::SelectObject(hDC, oldPen);
+		::SelectObject(hDC, oldBrush);
+		::DeleteObject(borderPen);
+		::DeleteObject(backgroundBrush);
+		SetTextColor(hDC, ghostTextColor_);
+		SetBkColor(hDC, ghostBackgroundColor_);
     }
     else if(isImmersive()) {
         SetTextColor(hDC, GetSysColor(COLOR_WINDOWTEXT));
@@ -128,8 +167,14 @@ void MessageWindow::onPaint(PAINTSTRUCT& ps) {
 
     SIZE size;
     GetTextExtentPoint32W(hDC, text_.c_str(), len, &size);
-    rc.top += (rc.bottom - size.cy)/2;
-    rc.left += (rc.right - size.cx)/2;
+	if (ghostStyle_) {
+		rc.top += (rc.bottom - size.cy) / 2;
+		rc.left += ghostPaddingX_;
+	}
+	else {
+		rc.top += (rc.bottom - size.cy)/2;
+		rc.left += (rc.right - size.cx)/2;
+	}
     ExtTextOutW(hDC, rc.left, rc.top, 0, &textrc, text_.c_str(), len, NULL);
 
     SelectObject(hDC, oldFont);

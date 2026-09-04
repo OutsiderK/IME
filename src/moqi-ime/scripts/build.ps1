@@ -47,14 +47,13 @@ function Remove-IfExists {
 function Invoke-External {
     param(
         [string] $FilePath,
-        [string[]] $ArgumentList,
-        [switch] $IgnoreExitCode
+		[string[]] $ArgumentList
     )
 
     Write-Host ">> $FilePath $($ArgumentList -join ' ')"
     & $FilePath @ArgumentList
     $exitCode = $LASTEXITCODE
-    if (-not $IgnoreExitCode -and $exitCode -ne 0) {
+	if ($exitCode -ne 0) {
         throw "Command failed with exit code ${exitCode}: $FilePath"
     }
     return $exitCode
@@ -82,28 +81,6 @@ function Get-GoToolExecutablePath {
     return (Join-Path $goBin ($ToolName + ".exe"))
 }
 
-function Get-GoTool {
-    param(
-        [string] $ToolName,
-        [string] $ModuleAtVersion
-    )
-
-    $toolPath = Get-GoToolExecutablePath -ToolName $ToolName
-    if (Test-Path -LiteralPath $toolPath) {
-        return $toolPath
-    }
-
-    Write-Host "[INFO] Installing Go tool: $ModuleAtVersion"
-    $null = Invoke-External -FilePath "go" -ArgumentList @("install", $ModuleAtVersion)
-
-    $toolPath = Get-GoToolExecutablePath -ToolName $ToolName
-    if (-not (Test-Path -LiteralPath $toolPath)) {
-        throw "Installed Go tool was not found: $toolPath"
-    }
-
-    return $toolPath
-}
-
 function Copy-DirectoryContents {
     param(
         [string] $Source,
@@ -114,10 +91,39 @@ function Copy-DirectoryContents {
     Copy-Item -Path (Join-Path $Source "*") -Destination $Destination -Recurse -Force
 }
 
+function Ensure-RimeFrost {
+    param(
+        [string] $RimeDataDir,
+        [string] $BuildRoot,
+        [string] $Revision
+    )
+
+    if (Test-Path -LiteralPath (Join-Path $RimeDataDir "default.yaml")) {
+        return
+    }
+
+    Write-Host "[INFO] Fetching pinned rime-frost data: $Revision"
+    $archive = Join-Path $BuildRoot ("rime-frost-" + $Revision + ".zip")
+    $extractRoot = Join-Path $BuildRoot ("rime-frost-" + $Revision)
+    Remove-IfExists -Path $archive
+    Remove-IfExists -Path $extractRoot
+    Invoke-WebRequest -Uri ("https://codeload.github.com/gaboolic/rime-frost/zip/" + $Revision) -OutFile $archive
+    Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot
+    $source = Get-ChildItem -LiteralPath $extractRoot -Directory | Select-Object -First 1
+    if ($null -eq $source) {
+        throw "Downloaded rime-frost archive did not contain a source directory."
+    }
+    Ensure-Directory -Path $RimeDataDir
+    Copy-DirectoryContents -Source $source.FullName -Destination $RimeDataDir
+    Remove-IfExists -Path $archive
+    Remove-IfExists -Path $extractRoot
+}
+
 function Prepare-RimeData {
     param(
         [string] $RimeDataDir,
-        [string] $PackageRimeDataDir
+        [string] $PackageRimeDataDir,
+        [string] $ProductDataDir
     )
 
     Remove-IfExists -Path $PackageRimeDataDir
@@ -126,14 +132,33 @@ function Prepare-RimeData {
     Write-Host "[INFO] Copying shared data from rime-frost submodule ..."
     Copy-DirectoryContents -Source $RimeDataDir -Destination $PackageRimeDataDir
 
-    Remove-IfExists -Path (Join-Path $PackageRimeDataDir ".github")
-
-    foreach ($name in @("README.md", "LICENSE")) {
-        $path = Join-Path $PackageRimeDataDir $name
-        if (Test-Path -LiteralPath $path) {
-            Remove-Item -LiteralPath $path -Force
-        }
+    # Keep the complete Frost base/cell dictionaries and language model for
+    # candidate quality. Remove only data that the product-owned schemas do
+    # not reference (Wubi/T9/translation/Emoji/OpenCC/dev material).
+    foreach ($relativePath in @(
+        ".github",
+        "cn_dicts_common",
+        "cn_dicts_wb",
+        "en_dicts",
+        "lua",
+        "opencc",
+        "others"
+    )) {
+        Remove-IfExists -Path (Join-Path $PackageRimeDataDir $relativePath)
     }
+    Remove-IfExists -Path (Join-Path $PackageRimeDataDir "cn_dicts\tencent.dict.yaml")
+
+    $rootPatterns = @("*.schema.yaml", "*.dict.yaml")
+    foreach ($pattern in $rootPatterns) {
+        Get-ChildItem -LiteralPath $PackageRimeDataDir -Filter $pattern -File -ErrorAction SilentlyContinue |
+            Remove-Item -Force
+    }
+    foreach ($name in @("README.md", "LICENSE", "custom_phrase.txt", "symbols.yaml", "symbols_v.yaml", "key_bindings.yaml", "punctuation.yaml")) {
+        Remove-IfExists -Path (Join-Path $PackageRimeDataDir $name)
+    }
+
+    Copy-Item -LiteralPath (Join-Path $RimeDataDir "rime_frost.dict.yaml") -Destination $PackageRimeDataDir -Force
+    Copy-DirectoryContents -Source $ProductDataDir -Destination $PackageRimeDataDir
 
     Write-Host "[INFO] Packaged Rime shared data prepared at `"$PackageRimeDataDir`""
 }
@@ -214,11 +239,14 @@ $InputMethodsDir = Join-Path $RepoRoot "input_methods"
 $IconsDir = Join-Path $RepoRoot "icons"
 $RimeDir = Join-Path $InputMethodsDir "rime"
 $RimeDataDir = Join-Path $RepoRoot "rime-frost"
+$ProductDataDir = Join-Path $RepoRoot "product-data"
 $PackageRimeDir = Join-Path $PackageDir "input_methods\rime"
 $PackageRimeDataDir = Join-Path $PackageRimeDir "data"
+$LocalAIRoot = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot "..\..\local-ai"))
 $ServerIcon = Join-Path $IconsDir "mo.ico"
 $ServerVersionInfo = Join-Path $BuildRoot "server.versioninfo.json"
 $ServerResource = Join-Path $RepoRoot "resource_windows_amd64.syso"
+$RimeFrostRevision = "2390afd35624b3c775d1df6f28524e257af79cd6"
 
 Write-Host "============================================"
 Write-Host " Moqi IME Go Backend Build Script"
@@ -235,6 +263,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "[INFO] Go version: $goVersion"
 
 Write-Step -Title "Step 1: Prepare output directory"
+Ensure-Directory -Path $BuildRoot
 if (Test-Path -LiteralPath $PackageDir) {
     Write-Host "[INFO] Removing old build output: `"$PackageDir`""
     Remove-Item -LiteralPath $PackageDir -Recurse -Force
@@ -242,25 +271,20 @@ if (Test-Path -LiteralPath $PackageDir) {
 Ensure-Directory -Path $PackageDir
 Write-Host "[INFO] Output directory: `"$PackageDir`""
 
+Ensure-RimeFrost -RimeDataDir $RimeDataDir -BuildRoot $BuildRoot -Revision $RimeFrostRevision
 if (-not (Test-Path -LiteralPath (Join-Path $RimeDataDir "default.yaml"))) {
-    throw "Missing rime-frost shared data submodule: `"$RimeDataDir`"`nRun: git submodule update --init --recursive rime-frost"
+	throw "Unable to prepare rime-frost shared data: `"$RimeDataDir`""
 }
 
 Push-Location $RepoRoot
 try {
-    Write-Step -Title "Step 2: Sync Go dependencies"
-    $tidyExitCode = Invoke-External -FilePath "go" -ArgumentList @("mod", "tidy") -IgnoreExitCode
-    if ($tidyExitCode -ne 0) {
-        Write-Warning "go mod tidy failed, continuing..."
-    }
-
-    Write-Step -Title "Step 3: Build go-backend server"
+    Write-Step -Title "Step 2: Build go-backend server"
     Write-Host "[INFO] Building server.exe with dynamic DLL loading ..."
 
     $oldGoos = $env:GOOS
     $oldGoarch = $env:GOARCH
     $oldCgoEnabled = $env:CGO_ENABLED
-    $goversioninfo = Get-GoTool -ToolName "goversioninfo" -ModuleAtVersion "github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest"
+	$goversioninfo = Get-GoToolExecutablePath -ToolName "goversioninfo"
     $env:GOOS = "windows"
     $env:GOARCH = "amd64"
     $env:CGO_ENABLED = "0"
@@ -270,10 +294,15 @@ try {
             throw "Missing server icon: `"$ServerIcon`""
         }
 
-        Write-ServerVersionInfo -VersionInfoPath $ServerVersionInfo -IconPath $ServerIcon
-        Remove-IfExists -Path $ServerResource
-        $null = Invoke-External -FilePath $goversioninfo -ArgumentList @("-64", "-o", $ServerResource, $ServerVersionInfo)
-        $null = Invoke-External -FilePath "go" -ArgumentList @("build", "-ldflags", "-s -w", "-o", $ServerExe, ".")
+		Remove-IfExists -Path $ServerResource
+		if (Test-Path -LiteralPath $goversioninfo) {
+			Write-ServerVersionInfo -VersionInfoPath $ServerVersionInfo -IconPath $ServerIcon
+			$null = Invoke-External -FilePath $goversioninfo -ArgumentList @("-64", "-o", $ServerResource, $ServerVersionInfo)
+		}
+		else {
+			Write-Warning "goversioninfo is not installed; building without optional Windows version metadata."
+		}
+        $null = Invoke-External -FilePath "go" -ArgumentList @("build", "-buildvcs=false", "-trimpath", "-ldflags", "-s -w", "-o", $ServerExe, ".")
     }
     finally {
         Remove-IfExists -Path $ServerResource
@@ -285,7 +314,7 @@ try {
 
     Write-Host "[INFO] Built: `"$ServerExe`""
 
-    Write-Step -Title "Step 4: Copy packaged input_methods"
+    Write-Step -Title "Step 3: Copy packaged input_methods"
     if (-not (Test-Path -LiteralPath $RimeDir)) {
         throw "Missing Rime input method directory: `"$RimeDir`""
     }
@@ -295,29 +324,32 @@ try {
     Copy-DirectoryContents -Source $RimeDir -Destination (Join-Path $packageInputMethodsDir "rime")
     Write-Host "[INFO] Packaged only input_methods\rime"
 
-    Write-Step -Title "Step 5: Copy shared icons"
+    Write-Step -Title "Step 4: Copy shared icons"
     if (Test-Path -LiteralPath $IconsDir) {
         Copy-DirectoryContents -Source $IconsDir -Destination (Join-Path $PackageDir "icons")
         Write-Host "[INFO] icons copied"
+    }
+
+    $localAIHelper = Join-Path $LocalAIRoot "ensure-local-ai.ps1"
+    if (Test-Path -LiteralPath $localAIHelper) {
+        $packageLocalAI = Join-Path $PackageDir "local-ai"
+        Ensure-Directory -Path $packageLocalAI
+        Copy-Item -LiteralPath $localAIHelper -Destination (Join-Path $packageLocalAI "ensure-local-ai.ps1") -Force
+        Write-Host "[INFO] Local AI lazy-start helper copied"
     }
     else {
         Write-Warning "Missing icons directory: `"$IconsDir`""
     }
 
-    Write-Step -Title "Step 6: Prepare packaged Rime shared data"
-    Prepare-RimeData -RimeDataDir $RimeDataDir -PackageRimeDataDir $PackageRimeDataDir
+    Write-Step -Title "Step 5: Prepare packaged Rime shared data"
+    Prepare-RimeData -RimeDataDir $RimeDataDir -PackageRimeDataDir $PackageRimeDataDir -ProductDataDir $ProductDataDir
 
-    $sourceAppearanceThemes = Join-Path $RimeDir "appearance_themes.json"
-    $packageAppearanceThemes = Join-Path $PackageRimeDir "appearance_themes.json"
-    $packageAppearanceThemesData = Join-Path $PackageRimeDataDir "appearance_themes.json"
-    if (-not (Test-Path -LiteralPath $sourceAppearanceThemes)) {
-        throw "Missing builtin appearance themes file: `"$sourceAppearanceThemes`""
-    }
-    Copy-Item -LiteralPath $sourceAppearanceThemes -Destination $packageAppearanceThemes -Force
-    Copy-Item -LiteralPath $sourceAppearanceThemes -Destination $packageAppearanceThemesData -Force
-    Write-Host "[INFO] Copied appearance_themes.json into packaged Rime runtime"
+	# The lightweight edition has one product-owned visual system.
+	Remove-IfExists -Path (Join-Path $PackageRimeDir "appearance_themes.json")
 
     $pathsToRemove = @(
+        @{ Path = Join-Path $PackageRimeDir "test"; Label = "Rime development test directory" },
+        @{ Path = Join-Path $PackageRimeDataDir ".gitignore"; Label = "Rime data build metadata" },
         @{ Path = Join-Path $PackageDir "input_methods\rime\data\others"; Label = "rime shared data others directory" },
         @{ Path = Join-Path $PackageDir "input_methods\rime\icons\icons"; Label = "nested icons directory" }
     )
@@ -340,7 +372,7 @@ try {
         Write-Host "[INFO] Copied rime.dll into package output"
     }
 
-    Write-Step -Title "Step 7: Generate backends.json snippet"
+    Write-Step -Title "Step 6: Generate backends.json snippet"
     @(
         [ordered]@{
             name       = "moqi-ime"
@@ -366,7 +398,7 @@ Write-Host ""
 Write-Host "Notes:"
 Write-Host "1. backends.json in this repo uses a top-level array."
 Write-Host "2. Ensure C:\Program Files (x86)\MoqiIM\backends.json includes moqi-ime."
-Write-Host "3. Ensure C:\Program Files (x86)\MoqiIM\moqi-ime\input_methods\*\ime.json exists."
+Write-Host "3. Ensure C:\Program Files (x86)\MoqiIM\moqi-ime\input_methods\rime\ime.json exists."
 Write-Host "4. Re-register both MoqiTextService.dll files after copying."
 Write-Host "5. Ensure C:\Program Files (x86)\MoqiIM\moqi-ime\input_methods\rime contains rime.dll."
 Write-Host "6. Start or restart MoqiLauncher.exe after install."

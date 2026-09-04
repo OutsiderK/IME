@@ -1,15 +1,12 @@
 package rime
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/gaboolic/moqi-ime/imecore"
-	"github.com/gaboolic/moqi-ime/input_methods/rime/cloudclipboard"
 )
 
 type userDictSyncState struct {
@@ -41,116 +38,65 @@ func (s *userDictSyncState) end() {
 	s.mu.Unlock()
 }
 
-func (ime *IME) syncUserDataCommand(resp *imecore.Response) bool {
+// Rime's native sync operation exports the current user database to the local
+// sync directory and merges snapshots already placed there. Keeping this local
+// preserves the useful import/export path without WebDAV or cloud state.
+func (ime *IME) runLocalUserDictionarySync(resp *imecore.Response, successMessage string) bool {
 	if ime.backend == nil {
 		if resp != nil {
-			resp.TrayNotification = trayNotification("用户词库同步失败：Rime 后端不可用", imecore.TrayNotificationIconError)
+			resp.TrayNotification = trayNotification("个人词库不可用：Rime 尚未启动", imecore.TrayNotificationIconError)
 		}
 		return false
 	}
 	if !sharedUserDictSyncState.begin() {
 		if resp != nil {
-			resp.TrayNotification = trayNotification("用户词库同步已在进行中", imecore.TrayNotificationIconInfo)
-			resp.ReturnValue = 1
+			resp.TrayNotification = trayNotification("个人词库正在处理", imecore.TrayNotificationIconInfo)
 		}
 		return true
 	}
 
-	if ime.asyncResponseSender == nil {
+	run := func() *imecore.TrayNotification {
 		defer sharedUserDictSyncState.end()
-		result, err := ime.syncUserDataWithWebDAV()
-		if resp != nil {
-			resp.TrayNotification = userDictSyncTrayNotification(result, err)
+		if !ime.backend.SyncUserData() {
+			return trayNotification("个人词库处理失败", imecore.TrayNotificationIconError)
 		}
-		return err == nil
+		return trayNotification(successMessage, imecore.TrayNotificationIconInfo)
 	}
 
-	if resp != nil {
-		resp.TrayNotification = trayNotification("开始同步用户词库...", imecore.TrayNotificationIconInfo)
-		resp.ReturnValue = 1
+	if ime.asyncResponseSender == nil {
+		notification := run()
+		if resp != nil {
+			resp.TrayNotification = notification
+		}
+		return notification.Icon != imecore.TrayNotificationIconError
 	}
-	go func() {
-		defer sharedUserDictSyncState.end()
-		result, err := ime.syncUserDataWithWebDAV()
-		ime.sendAsyncTrayNotification(userDictSyncTrayNotification(result, err))
-	}()
+	if resp != nil {
+		resp.TrayNotification = trayNotification("正在处理个人词库…", imecore.TrayNotificationIconInfo)
+	}
+	go func() { ime.sendAsyncTrayNotification(run()) }()
 	return true
 }
 
-func (ime *IME) syncUserDataWithWebDAV() (cloudclipboard.UserDictSnapshotSyncResult, error) {
-	var result cloudclipboard.UserDictSnapshotSyncResult
+func (ime *IME) exportUserDictionary(resp *imecore.Response) bool {
+	return ime.runLocalUserDictionarySync(resp, "词库快照已导出到本地")
+}
+
+func (ime *IME) importUserDictionary(resp *imecore.Response) bool {
+	return ime.runLocalUserDictionarySync(resp, "本地词库快照已合并")
+}
+
+func (ime *IME) syncUserDataCommand(resp *imecore.Response) bool {
+	return ime.importUserDictionary(resp)
+}
+
+func (ime *IME) userDictionarySnapshotDir() (string, error) {
 	userDir := ime.userDir()
 	if userDir == "" {
-		return result, fmt.Errorf("无法确定 Rime 用户目录")
+		return "", fmt.Errorf("无法确定 Rime 用户目录")
 	}
-	schemeSet := currentSchemeSetName()
-	if !cloudclipboard.IsSchemeSetDirName(schemeSet) {
-		return result, fmt.Errorf("方案集名称无效")
+	path := filepath.Join(userDir, "sync")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return "", err
 	}
-	localSyncRoot := filepath.Join(userDir, "sync")
-
-	cfg := loadCloudClipboardConfig()
-	webdavReady := cfg.IsComplete() && cloudclipboard.IsAllowedBaseURL(cfg.BaseURL)
-	var webdavSync *cloudclipboard.Sync
-	if webdavReady {
-		cfg.Enabled = true
-		webdavSync = cloudclipboard.NewSync(cfg)
-		downloaded, err := webdavSync.DownloadUserDictSnapshots(localSyncRoot, schemeSet)
-		if err != nil {
-			return result, fmt.Errorf("下载远端快照失败: %w", err)
-		}
-		result.Downloaded = downloaded
-	}
-
-	if ime.backend == nil || !ime.backend.SyncUserData() {
-		return result, fmt.Errorf("librime 合并用户词库失败")
-	}
-
-	if webdavReady {
-		deviceID := readRimeInstallationID(userDir)
-		if deviceID == "" {
-			return result, fmt.Errorf("无法读取本机 Rime installation_id")
-		}
-		uploaded, err := webdavSync.UploadUserDictSnapshots(localSyncRoot, schemeSet, deviceID)
-		if err != nil {
-			return result, fmt.Errorf("上传本机快照失败: %w", err)
-		}
-		result.Uploaded = uploaded
-	}
-	return result, nil
-}
-
-func userDictSyncTrayNotification(result cloudclipboard.UserDictSnapshotSyncResult, err error) *imecore.TrayNotification {
-	if err != nil {
-		return trayNotification("用户词库同步失败: "+shortErrorMessage(err), imecore.TrayNotificationIconError)
-	}
-	if result.Downloaded == 0 && result.Uploaded == 0 {
-		return trayNotification("用户资料同步完成", imecore.TrayNotificationIconInfo)
-	}
-	return trayNotification(
-		fmt.Sprintf("用户词库同步完成：下载 %d，上传 %d", result.Downloaded, result.Uploaded),
-		imecore.TrayNotificationIconInfo,
-	)
-}
-
-func readRimeInstallationID(userDir string) string {
-	file, err := os.Open(filepath.Join(userDir, "installation.yaml"))
-	if err != nil {
-		return ""
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "#") || !strings.HasPrefix(line, "installation_id:") {
-			continue
-		}
-		value := strings.TrimSpace(strings.TrimPrefix(line, "installation_id:"))
-		value = strings.Trim(value, `"'`)
-		if cloudclipboard.IsSyncDeviceDirName(value) {
-			return value
-		}
-	}
-	return ""
+	return path, nil
 }

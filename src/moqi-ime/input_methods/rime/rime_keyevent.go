@@ -150,6 +150,15 @@ func translateKeyCode(req *imecore.Request) int {
 	if isPrintableChar(req) {
 		return req.CharCode
 	}
+	// TSF occasionally supplies a virtual key without a translated character,
+	// notably during the filter phase. Digits are layout-independent, so they
+	// can be recovered without calling keyboard-layout APIs on the hot path.
+	if keyCode >= '0' && keyCode <= '9' {
+		return keyCode
+	}
+	if keyCode >= 0x60 && keyCode <= 0x69 { // VK_NUMPAD0..VK_NUMPAD9
+		return '0' + keyCode - 0x60
+	}
 	if keyCode >= vkF1 && keyCode <= vkF12 {
 		return rimeF1 + keyCode - vkF1
 	}

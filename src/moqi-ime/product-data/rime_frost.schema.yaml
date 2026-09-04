@@ -1,0 +1,78 @@
+# U 输入法·白霜全拼
+# encoding: utf-8
+
+schema:
+  schema_id: rime_frost
+  name: 白霜拼音
+  version: "1.0"
+  author:
+    - gaboolic
+    - U IME
+  description: 面向个人日用的精简白霜全拼
+
+switches:
+  - name: ascii_mode
+    states: [ 中文, 英文 ]
+  - name: full_shape
+    states: [ 半角, 全角 ]
+  - name: ascii_punct
+    states: [ 中文标点, 英文标点 ]
+
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - script_translator
+  filters:
+    - uniquifier
+
+speller:
+  alphabet: zyxwvutsrqponmlkjihgfedcba
+  initials: zyxwvutsrqponmlkjihgfedcba
+  delimiter: " '"
+  algebra:
+    - abbrev/^([a-z]).+$/$1/
+    - abbrev/^([zcs]h).+$/$1/
+    - derive/^([nl])ve$/$1ue/
+    - derive/^([jqxy])u/$1v/
+    - derive/^([nl])ue$/$1ve/
+    - derive/^([jqxy])v/$1u/
+
+translator:
+  dictionary: rime_frost
+  prism: rime_frost
+  enable_user_dict: true
+  enable_sentence: true
+  enable_completion: true
+  grammar_penalty: -4
+  max_homophones: 4
+  max_homographs: 4
+  max_sentences: 3
+  initial_quality: 1.0
+
+grammar:
+  language: zh-moqi
+  non_collocation_penalty: -4
+
+punctuator:
+  import_preset: default
+
+key_binder:
+  import_preset: default
+
+recognizer:
+  patterns: {}

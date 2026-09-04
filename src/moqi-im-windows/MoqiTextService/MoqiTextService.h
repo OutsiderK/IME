@@ -312,6 +312,9 @@ public:
 	void showMessage(Ime::EditSession* session, std::wstring message, int duration = 3);
     void updateMessageWindow(Ime::EditSession* session);
 	void hideMessage();
+	void setGhostInlinePreferred(bool preferred) {
+		ghostInlinePreferred_ = preferred;
+	}
 
 private:
 	virtual ~TextService(void);  // COM object should only be deleted using Release()
@@ -332,7 +335,8 @@ private:
 	void invalidateCandidateUiCache();
 	bool isCandidateContentApplied(const std::wstring& renderedPreedit) const;
 	void markCandidateContentApplied(const std::wstring& renderedPreedit);
-	bool moveCandidateWindowToInputRect(Ime::EditSession* session, const wchar_t* reason, bool throttleSamePosition);
+	bool moveCandidateWindowToInputRect(Ime::EditSession* session, const wchar_t* reason);
+	bool moveMessageWindowToInputRect(Ime::EditSession* session);
 
 	bool ensureClientForCurrentProfile(const wchar_t* reason);
 	void closeClient();
@@ -356,11 +360,11 @@ private:
 	bool hasAppliedCandidateContent_;
 	bool hasAppliedCandidateCursor_;
 	int appliedCandidateCursor_;
-	bool hasLastCandidateWindowPos_;
-	POINT lastCandidateWindowPos_;
-	ULONGLONG lastCandidateWindowMoveTick_;
+	bool hasCandidateWindowAnchor_;
+	POINT candidateWindowAnchor_;
 	std::unique_ptr<Ime::MessageWindow> messageWindow_;
 	UINT messageTimerId_;
+	bool ghostInlinePreferred_;
 	HFONT font_;
 	HFONT commentFont_;
 	bool updateFont_;

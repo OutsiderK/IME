@@ -30,8 +30,6 @@
 #include <Shellapi.h>
 #include <VersionHelpers.h> // Provided by Windows SDK >= 8.1
 #include <Winnls.h> // for IS_HIGH_SURROGATE() macro for checking UTF16 surrogate pairs
-#include <mmsystem.h> // for timeBeginPeriod/timeEndPeriod (timer resolution during RPC waits)
-#pragma comment(lib, "winmm.lib")
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -40,6 +38,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <inputscope.h>
 #include <exception>
@@ -49,15 +48,14 @@ using namespace std;
 
 namespace Moqi {
 
+struct AsyncCallbackState {
+  std::recursive_mutex mutex;
+  Client *client = nullptr;
+};
+
 static constexpr UINT ASYNC_RPC_POLL_INTERVAL_MS = 50;
 static constexpr int FIRST_PRINTABLE_KEY_RPC_WAIT_MS = 200;
 static constexpr DWORD RPC_BUSY_POLL_INTERVAL_MS = 5;
-// Poll interval while waiting for a pipe reply. Must stay small (1-2ms): the
-// reply normally arrives within a few ms, and a large Sleep() would add up to
-// that delay to every keystroke (the old 50ms poll made typing feel very
-// laggy). timeBeginPeriod(1) inside the wait keeps this a real ~2ms instead of
-// the default ~15.6ms system tick.
-static constexpr DWORD RPC_REPLY_POLL_INTERVAL_MS = 2;
 
 // Bounded waits so a not-yet-started or hung MoqiLauncher/backend can never
 // block the TSF thread indefinitely:
@@ -81,6 +79,31 @@ static constexpr ULONGLONG LAUNCHER_START_RETRY_COOLDOWN_MS = 3000;
 static constexpr ULONGLONG LAUNCHER_KILL_RETRY_COOLDOWN_MS = 15000;
 
 namespace {
+
+std::atomic<UINT_PTR> nextAsyncTimerId{0x4d4f5100};
+std::mutex asyncTimerRegistryMutex;
+std::unordered_map<UINT_PTR, std::weak_ptr<AsyncCallbackState>>
+    asyncTimerRegistry;
+
+void registerAsyncTimer(UINT_PTR id,
+                        const std::shared_ptr<AsyncCallbackState> &state) {
+  std::lock_guard<std::mutex> lock(asyncTimerRegistryMutex);
+  asyncTimerRegistry[id] = state;
+}
+
+void unregisterAsyncTimer(UINT_PTR id) {
+  std::lock_guard<std::mutex> lock(asyncTimerRegistryMutex);
+  asyncTimerRegistry.erase(id);
+}
+
+std::shared_ptr<AsyncCallbackState> findAsyncTimer(UINT_PTR id) {
+  std::lock_guard<std::mutex> lock(asyncTimerRegistryMutex);
+  const auto it = asyncTimerRegistry.find(id);
+  if (it == asyncTimerRegistry.end()) {
+    return {};
+  }
+  return it->second.lock();
+}
 
 constexpr GUID kGuidPropInputScope = {
     0x1713dd5a,
@@ -560,13 +583,17 @@ Client::Client(TextService *service, REFIID langProfileGuid)
       lastLauncherStartAttemptTick_{0}, lastLauncherKillTick_{0},
       asyncPollTimerWindow_(nullptr),
       asyncPollTimerId_(0), asyncFlushInProgress_(false),
-      autoPairRules_(defaultAutoPairRules()) {}
+      asyncApplyInProgress_(false),
+      asyncCallbackState_(std::make_shared<AsyncCallbackState>()),
+      autoPairRules_(defaultAutoPairRules()) {
+  asyncCallbackState_->client = this;
+}
 
 Client::~Client(void) {
-  if (asyncPollTimerId_ != 0) {
-    ::KillTimer(asyncPollTimerWindow_, asyncPollTimerId_);
-    asyncPollTimerId_ = 0;
-    asyncPollTimerWindow_ = nullptr;
+  stopAsyncPollTimer();
+  if (asyncCallbackState_) {
+    std::lock_guard<std::recursive_mutex> lock(asyncCallbackState_->mutex);
+    asyncCallbackState_->client = nullptr;
   }
   closeRpcConnection();
   resetTextServiceState();
@@ -1137,6 +1164,10 @@ bool Client::onKeyDown(Ime::KeyEvent &keyEvent, Ime::EditSession *session) {
   auto req = createRpcRequest("onKeyDown");
   addKeyEventToRpcRequest(req, keyEvent);
 
+  if (keyEvent.keyCode() == VK_F8 && textService_ != nullptr) {
+    textService_->setGhostInlinePreferred(textAfterCaret(session, 1).empty());
+  }
+
   // TSF does not call OnKeyUp for ordinary keys unless TestKeyUp reports the
   // key as eaten. Capture the text here instead; the backend combines it with
   // the commit produced by this key and starts completion only after a real
@@ -1374,6 +1405,10 @@ bool Client::onPreservedKey(const GUID &guid, Ime::EditSession *session) {
     auto req = createRpcRequest("onPreservedKey");
     req.set_preserved_key_guid(guidStr);
 
+    if (textService_ != nullptr) {
+      textService_->setGhostInlinePreferred(textAfterCaret(session, 1).empty());
+    }
+
     // F8 can be pressed after a mouse caret move or after text was edited by
     // another input method. Send fresh private surrounding text so completion
     // is driven by the actual caret position instead of stale commit state.
@@ -1556,10 +1591,24 @@ moqi::protocol::ClientRequest Client::createRpcRequest(const char *methodName) {
 }
 
 void CALLBACK Client::onAsyncPollTimer(HWND, UINT, UINT_PTR id, DWORD) {
-  auto *client = reinterpret_cast<Client *>(id);
-  if (client != nullptr) {
-    client->pollAsyncResponses();
+  const auto state = findAsyncTimer(id);
+  if (!state) {
+    return;
   }
+  std::lock_guard<std::recursive_mutex> lock(state->mutex);
+  if (state->client != nullptr) {
+    state->client->pollAsyncResponses();
+  }
+}
+
+void Client::stopAsyncPollTimer() {
+  if (asyncPollTimerId_ == 0) {
+    return;
+  }
+  ::KillTimer(asyncPollTimerWindow_, asyncPollTimerId_);
+  unregisterAsyncTimer(asyncPollTimerId_);
+  asyncPollTimerId_ = 0;
+  asyncPollTimerWindow_ = nullptr;
 }
 
 void Client::refreshAsyncPollTimer() {
@@ -1571,16 +1620,21 @@ void Client::refreshAsyncPollTimer() {
 
   if (asyncPollTimerId_ != 0 &&
       (targetWindow == nullptr || targetWindow != asyncPollTimerWindow_)) {
-    ::KillTimer(asyncPollTimerWindow_, asyncPollTimerId_);
-    asyncPollTimerId_ = 0;
-    asyncPollTimerWindow_ = nullptr;
+    stopAsyncPollTimer();
   }
 
   if (targetWindow != nullptr && asyncPollTimerId_ == 0) {
-    asyncPollTimerId_ =
-        ::SetTimer(targetWindow, reinterpret_cast<UINT_PTR>(this),
-                   ASYNC_RPC_POLL_INTERVAL_MS, &Client::onAsyncPollTimer);
+    UINT_PTR requestedId = nextAsyncTimerId.fetch_add(1);
+    if (requestedId == 0) {
+      requestedId = nextAsyncTimerId.fetch_add(1);
+    }
+    asyncPollTimerId_ = ::SetTimer(targetWindow, requestedId,
+                                   ASYNC_RPC_POLL_INTERVAL_MS,
+                                   &Client::onAsyncPollTimer);
     asyncPollTimerWindow_ = asyncPollTimerId_ != 0 ? targetWindow : nullptr;
+    if (asyncPollTimerId_ != 0) {
+      registerAsyncTimer(asyncPollTimerId_, asyncCallbackState_);
+    }
   }
 }
 
@@ -1613,27 +1667,7 @@ bool Client::readPendingPipeMessage(std::string &serializedReply) {
     return false;
   }
 
-  char buf[1024];
-  DWORD rlen = 0;
-  bool hasMoreData = false;
-  if (!::ReadFile(pipe_, buf, sizeof(buf), &rlen, nullptr)) {
-    if (::GetLastError() == ERROR_MORE_DATA) {
-      hasMoreData = true;
-    } else {
-      return false;
-    }
-  }
-  serializedReply.append(buf, rlen);
-
-  while (hasMoreData) {
-    if (::ReadFile(pipe_, buf, sizeof(buf), &rlen, nullptr)) {
-      hasMoreData = false;
-    } else if (::GetLastError() != ERROR_MORE_DATA) {
-      return false;
-    }
-    serializedReply.append(buf, rlen);
-  }
-  return true;
+  return readPipeMessageWithTimeout(pipe_, serializedReply, 0, nullptr);
 }
 
 void Client::enqueueAsyncResponse(const moqi::protocol::ServerResponse &response) {
@@ -1649,12 +1683,25 @@ bool Client::applyAsyncResponse(Json::Value &msg, Ime::EditSession *session) {
 }
 
 void Client::flushPendingAsyncResponses(Ime::EditSession *session) {
+  if (asyncApplyInProgress_) {
+    return;
+  }
+  asyncApplyInProgress_ = true;
+  struct ApplyGuard {
+    bool &flag;
+    ~ApplyGuard() { flag = false; }
+  } guard{asyncApplyInProgress_};
+
   while (!pendingAsyncResponses_.empty()) {
-    Json::Value msg = pendingAsyncResponses_.front();
+    // Remove the item before applying it. Updating a TSF window can dispatch
+    // nested messages, and an inner RPC/paint callback must never pop the same
+    // deque element while JsonCpp is still using it.
+    Json::Value msg = std::move(pendingAsyncResponses_.front());
+    pendingAsyncResponses_.pop_front();
     if (!applyAsyncResponse(msg, session)) {
+      pendingAsyncResponses_.push_front(std::move(msg));
       break;
     }
-    pendingAsyncResponses_.pop_front();
   }
 }
 
@@ -1675,19 +1722,25 @@ void Client::flushPendingAsyncResponsesWithCurrentContext() {
 
   HRESULT sessionResult = E_FAIL;
   asyncFlushInProgress_ = true;
+  const auto callbackState = asyncCallbackState_;
   auto editSession = Ime::ComPtr<Ime::EditSession>::make(
       context,
-      [this](Ime::EditSession *session, TfEditCookie) {
-        flushPendingAsyncResponses(session);
-        asyncFlushInProgress_ = false;
+      [callbackState](Ime::EditSession *session, TfEditCookie) {
+        std::lock_guard<std::recursive_mutex> lock(callbackState->mutex);
+        if (callbackState->client != nullptr) {
+          callbackState->client->flushPendingAsyncResponses(session);
+          callbackState->client->asyncFlushInProgress_ = false;
+        }
       });
-  context->RequestEditSession(textService_->clientId(), editSession,
-                              TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
-                              &sessionResult);
-  if (FAILED(sessionResult)) {
+  const HRESULT requestResult = context->RequestEditSession(
+      textService_->clientId(), editSession,
+      TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &sessionResult);
+  if (FAILED(requestResult) || FAILED(sessionResult)) {
     asyncFlushInProgress_ = false;
     appendRpcGuardLog(L"async response RequestEditSession failed hr=" +
-                      std::to_wstring(static_cast<long>(sessionResult)));
+                      std::to_wstring(static_cast<long>(FAILED(requestResult)
+                                                           ? requestResult
+                                                           : sessionResult)));
   }
 }
 
@@ -1729,71 +1782,74 @@ bool Client::readPipeMessageWithTimeout(HANDLE pipe, std::string &message,
     return false;
   }
   const ULONGLONG deadline = ::GetTickCount64() + timeoutMs;
-
-  // Raise the timer resolution for the duration of the wait. PeekNamedPipe +
-  // Sleep() polling is how the reply is discovered, and with the default
-  // ~15.6ms system tick a reply that arrives a few ms after the poll would not
-  // be noticed for up to ~50ms -- once per RPC, and each keystroke issues
-  // several RPCs, which made typing feel very laggy. timeBeginPeriod is
-  // ref-counted by the OS and released as soon as the reply arrives, so the
-  // impact on the rest of the system is limited to the wait itself.
-  const MMRESULT timerResult = ::timeBeginPeriod(1);
-  const bool timerPeriodActive = timerResult == TIMERR_NOERROR;
-
   char buf[1024];
   while (true) {
-    DWORD bytesAvailable = 0;
-    if (!::PeekNamedPipe(pipe, nullptr, 0, nullptr, &bytesAvailable, nullptr)) {
-      if (timerPeriodActive) {
-        ::timeEndPeriod(1);
-      }
+    OVERLAPPED overlapped = {};
+    overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!overlapped.hEvent) {
       return false;
     }
-    if (bytesAvailable > 0) {
-      DWORD rlen = 0;
-      bool hasMoreData = false;
-      if (!::ReadFile(pipe, buf, sizeof(buf), &rlen, nullptr)) {
-        if (::GetLastError() == ERROR_MORE_DATA) {
-          hasMoreData = true;
-        } else { // unknown error
-          if (timerPeriodActive) {
-            ::timeEndPeriod(1);
-          }
-          return false;
-        }
-      }
-      message.append(buf, rlen);
 
-      while (hasMoreData) {
-        if (::ReadFile(pipe, buf, sizeof(buf), &rlen, nullptr)) {
-          hasMoreData = false;
-        } else if (::GetLastError() != ERROR_MORE_DATA) { // unknown error
-          if (timerPeriodActive) {
-            ::timeEndPeriod(1);
-          }
-          return false;
+    DWORD bytesRead = 0;
+    bool moreData = false;
+    BOOL completed = ::ReadFile(pipe, buf, sizeof(buf), &bytesRead, &overlapped);
+    DWORD error = completed ? ERROR_SUCCESS : ::GetLastError();
+    if (!completed && error == ERROR_IO_PENDING) {
+      const ULONGLONG now = ::GetTickCount64();
+      const DWORD remaining = now >= deadline ? 0 : static_cast<DWORD>(deadline - now);
+      const DWORD waitResult = ::WaitForSingleObject(overlapped.hEvent, remaining);
+      if (waitResult != WAIT_OBJECT_0) {
+        ::CancelIoEx(pipe, &overlapped);
+        ::WaitForSingleObject(overlapped.hEvent, INFINITE);
+        ::CloseHandle(overlapped.hEvent);
+        if (timedOut != nullptr && waitResult == WAIT_TIMEOUT) {
+          *timedOut = true;
         }
-        message.append(buf, rlen);
+        return false;
       }
-      if (timerPeriodActive) {
-        ::timeEndPeriod(1);
-      }
+      completed = ::GetOverlappedResult(pipe, &overlapped, &bytesRead, FALSE);
+      error = completed ? ERROR_SUCCESS : ::GetLastError();
+    }
+    ::CloseHandle(overlapped.hEvent);
+
+    if (!completed && error != ERROR_MORE_DATA) {
+      return false;
+    }
+    moreData = error == ERROR_MORE_DATA;
+    message.append(buf, bytesRead);
+    if (!moreData) {
       return true;
     }
-    const ULONGLONG now = ::GetTickCount64();
-    if (now >= deadline) {
-      if (timedOut != nullptr) {
-        *timedOut = true;
-      }
-      if (timerPeriodActive) {
-        ::timeEndPeriod(1);
-      }
-      return false; // timed out waiting for the reply
-    }
-    ::Sleep(static_cast<DWORD>(
-        (std::min)(static_cast<ULONGLONG>(RPC_REPLY_POLL_INTERVAL_MS),
-                   deadline - now)));
   }
+}
+
+bool Client::writePipeMessageWithTimeout(HANDLE pipe, const std::string &message,
+                                         DWORD timeoutMs) {
+  if (pipe == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  OVERLAPPED overlapped = {};
+  overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!overlapped.hEvent) {
+    return false;
+  }
+  DWORD written = 0;
+  BOOL completed = ::WriteFile(pipe, message.data(),
+                               static_cast<DWORD>(message.size()), &written,
+                               &overlapped);
+  DWORD error = completed ? ERROR_SUCCESS : ::GetLastError();
+  if (!completed && error == ERROR_IO_PENDING) {
+    const DWORD waitResult = ::WaitForSingleObject(overlapped.hEvent, timeoutMs);
+    if (waitResult == WAIT_OBJECT_0) {
+      completed = ::GetOverlappedResult(pipe, &overlapped, &written, FALSE);
+    } else {
+      ::CancelIoEx(pipe, &overlapped);
+      ::WaitForSingleObject(overlapped.hEvent, INFINITE);
+      completed = FALSE;
+    }
+  }
+  ::CloseHandle(overlapped.hEvent);
+  return completed && written == message.size();
 }
 
 bool Client::callRpcPipe(HANDLE pipe, const std::string &serializedRequest,
@@ -1804,11 +1860,8 @@ bool Client::callRpcPipe(HANDLE pipe, const std::string &serializedRequest,
   // Write the request as one pipe message, then wait for the reply with a
   // bounded deadline (WriteFile + ReadFile instead of the unbounded
   // TransactNamedPipe).
-  DWORD written = 0;
-  if (!::WriteFile(pipe, serializedRequest.data(),
-                   static_cast<DWORD>(serializedRequest.size()), &written,
-                   nullptr) ||
-      written != serializedRequest.size()) {
+  if (!writePipeMessageWithTimeout(pipe, serializedRequest,
+                                   RPC_ASYNC_REPLY_WAIT_MS)) {
     return false;
   }
   return readPipeMessageWithTimeout(pipe, serializedReply,
@@ -1869,8 +1922,6 @@ bool Client::callRpcMethod(moqi::protocol::ClientRequest &request,
       success = false;
     }
 
-    flushPendingAsyncResponses();
-
     if (!success) {
       // A pure timeout on an already-initialized connection usually means the
       // backend is slow (cold start: first request per engine can take seconds),
@@ -1914,7 +1965,7 @@ HANDLE Client::connectPipe(const wchar_t *pipeName, int timeoutMs) {
   HANDLE pipe = INVALID_HANDLE_VALUE;
   if (WaitNamedPipe(pipeName, timeoutMs)) {
     pipe = CreateFile(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL,
-                      OPEN_EXISTING, 0, NULL);
+                      OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
   }
 
   if (pipe != INVALID_HANDLE_VALUE) {
@@ -1972,9 +2023,7 @@ void Client::sendRpcNoWait(const char *methodName) {
   if (!Proto::serializeMessage(req, serializedRequest)) {
     return;
   }
-  DWORD written = 0;
-  ::WriteFile(pipe_, serializedRequest.data(),
-              static_cast<DWORD>(serializedRequest.size()), &written, nullptr);
+  writePipeMessageWithTimeout(pipe_, serializedRequest, 200);
 }
 
 bool Client::ensureLauncherRunning() {
@@ -2006,8 +2055,32 @@ bool Client::ensureLauncherRunning() {
     return false;
   }
 
-  // Use CreateProcessW instead of ShellExecuteW: it cannot fail on the secure
-  // desktop / early logon and we control the working directory explicitly.
+  // Hand the launch to the already-running desktop Explorer. A TSF can be
+  // loaded by a packaged application with a restricted token; directly
+  // creating the broker from there makes the user's model directory appear
+  // missing. Explorer dispatches the executable in the interactive desktop
+  // user's context. SYSTEM hosts were rejected above, so this is never used on
+  // the secure desktop. Keep direct CreateProcessW as a bounded fallback when
+  // the desktop shell is temporarily unavailable.
+  wchar_t windowsDir[MAX_PATH] = {};
+  if (::GetWindowsDirectoryW(windowsDir, _countof(windowsDir)) > 0) {
+    const std::wstring explorerPath =
+        std::wstring(windowsDir) + L"\\explorer.exe";
+    std::wstring shellCommandLine =
+        L"\"" + explorerPath + L"\" \"" + launcherPath + L"\"";
+    STARTUPINFOW shellStartupInfo = {};
+    shellStartupInfo.cb = sizeof(shellStartupInfo);
+    PROCESS_INFORMATION shellProcessInfo = {};
+    if (::CreateProcessW(explorerPath.c_str(), shellCommandLine.data(), nullptr,
+                         nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                         module->programDir().c_str(), &shellStartupInfo,
+                         &shellProcessInfo)) {
+      ::CloseHandle(shellProcessInfo.hThread);
+      ::CloseHandle(shellProcessInfo.hProcess);
+      return true;
+    }
+  }
+
   std::wstring commandLine = L"\"" + launcherPath + L"\"";
   STARTUPINFOW startupInfo = {};
   startupInfo.cb = sizeof(startupInfo);
@@ -2145,11 +2218,7 @@ void Client::resetTextServiceState() {
 void Client::closeRpcConnection() {
   pendingAsyncResponses_.clear();
   handshakeComplete_ = false;
-  if (asyncPollTimerId_ != 0) {
-    ::KillTimer(asyncPollTimerWindow_, asyncPollTimerId_);
-    asyncPollTimerId_ = 0;
-    asyncPollTimerWindow_ = nullptr;
-  }
+  stopAsyncPollTimer();
   if (pipe_ != INVALID_HANDLE_VALUE) {
     DisconnectNamedPipe(pipe_);
     CloseHandle(pipe_);
