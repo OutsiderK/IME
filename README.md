@@ -39,6 +39,8 @@ AI 快捷键：
 - `src/moqi-ime/product-data`：产品自有的精简 Rime 配置；保留原方案 ID 以继承 userdb。
 - `local-ai`：本地模型服务的懒启动脚本。
 - `ARCHITECTURE.md`：轻量化边界、运行链路和故障隔离。
+- [`src/moqi-ime/docs/ai-completion-acceptance-plan.md`](src/moqi-ime/docs/ai-completion-acceptance-plan.md)：AI 续写接受率研究、分阶段工程方案和测试方法。
+- [`src/moqi-ime/docs/pinyin-reranker-training.md`](src/moqi-ime/docs/pinyin-reranker-training.md)：提交前拼音候选重排的训练与评估记录。
 - `DESIGN.md` / `UI-GUIDANCE.md`：视觉系统与产品语义准则。
 
 ## 构建
