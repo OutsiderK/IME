@@ -2,6 +2,7 @@ package rime
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -144,6 +145,10 @@ func (c *aiClient) GenerateReviewCandidates(input aiGenerateRequest) ([]string, 
 }
 
 func (c *aiClient) GenerateInlineCompletions(input aiCompletionRequest, cfg aiCompletionConfig) ([]string, error) {
+	return c.GenerateInlineCompletionsContext(context.Background(), input, cfg)
+}
+
+func (c *aiClient) GenerateInlineCompletionsContext(ctx context.Context, input aiCompletionRequest, cfg aiCompletionConfig) ([]string, error) {
 	if c == nil {
 		return nil, fmt.Errorf("AI client is not configured")
 	}
@@ -225,7 +230,7 @@ func (c *aiClient) GenerateInlineCompletions(input aiCompletionRequest, cfg aiCo
 		payload.DryPenaltyLastN = 64
 	}
 
-	content, err := c.complete(payload)
+	content, err := c.completeContext(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -280,11 +285,15 @@ func isLoopbackAIEndpoint(baseURL string) bool {
 }
 
 func (c *aiClient) complete(payload chatCompletionsRequest) (string, error) {
+	return c.completeContext(context.Background(), payload)
+}
+
+func (c *aiClient) completeContext(ctx context.Context, payload chatCompletionsRequest) (string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshal AI request: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("create AI request: %w", err)
 	}

@@ -1,6 +1,7 @@
 package rime
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -81,15 +82,21 @@ func (runtime *localAIRuntime) stop() {
 	}
 }
 
-func managedCompletionGenerator(client *aiClient, mode aiRunMode, idleMinutes int) func(aiCompletionRequest, aiCompletionConfig) ([]string, error) {
+func managedCompletionGenerator(client *aiClient, mode aiRunMode, idleMinutes int) func(context.Context, aiCompletionRequest, aiCompletionConfig) ([]string, error) {
 	if client == nil {
 		return nil
 	}
-	return func(input aiCompletionRequest, cfg aiCompletionConfig) ([]string, error) {
+	return func(ctx context.Context, input aiCompletionRequest, cfg aiCompletionConfig) ([]string, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if err := sharedLocalAIRuntime.ensure(client, mode, idleMinutes); err != nil {
 			return nil, err
 		}
-		candidates, err := client.GenerateInlineCompletions(input, cfg)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		candidates, err := client.GenerateInlineCompletionsContext(ctx, input, cfg)
 		sharedLocalAIRuntime.touch(mode, idleMinutes)
 		return candidates, err
 	}

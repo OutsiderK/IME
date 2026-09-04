@@ -1,12 +1,15 @@
 package rime
 
 import (
+	contextpkg "context"
+	"errors"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/gaboolic/moqi-ime/imecore"
+	"github.com/gaboolic/moqi-ime/internal/ghosttelemetry"
 )
 
 const (
@@ -21,7 +24,40 @@ const (
 	ghostLongPreservedKeyGUID = "{018e48c0-a24f-4b72-bacc-57a2d53284b9}"
 	ghostNextPreservedKeyGUID = "{316649a5-9c0b-4708-a43d-7bedc5bde9bb}"
 	ghostContextEnvelope      = "\x1eMOQI_CONTEXT_V1\x1f"
+	ghostFeatureVersion       = 1
+	ghostQuickUndoWindow      = 3 * time.Second
 )
+
+type ghostRequestState struct {
+	id                     uint64
+	opportunityID          uint64
+	cancel                 contextpkg.CancelFunc
+	cancelRequested        bool
+	started                time.Time
+	telemetry              *ghosttelemetry.Recorder
+	closeTelemetryOnFinish bool
+}
+
+type ghostDeferredClose struct {
+	opportunityID uint64
+	reason        string
+	context       string
+	candidates    []string
+	candidateIDs  []uint64
+}
+
+type ghostPendingCommit struct {
+	opportunityID uint64
+	candidateID   uint64
+}
+
+type ghostAcceptedState struct {
+	opportunityID  uint64
+	candidateID    uint64
+	acceptedAt     time.Time
+	remainingRunes int
+	undoRecorded   bool
+}
 
 func ghostPreservedKeyInfos() []imecore.PreservedKeyInfo {
 	// TSF preserved-key callbacks have caused repeatable host-process crashes
@@ -36,10 +72,37 @@ func (ime *IME) ghostCompletionEnabled() bool {
 	return ime.ghostEnabled
 }
 
+func (ime *IME) configureGhostTelemetry(enabled bool) {
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	if !enabled {
+		recorder := ime.ghostTelemetry
+		ime.ghostTelemetry = nil
+		if recorder != nil {
+			if ime.ghostRequest != nil && ime.ghostRequest.telemetry == recorder {
+				ime.ghostRequest.closeTelemetryOnFinish = true
+			} else {
+				_ = recorder.Close()
+			}
+		}
+		return
+	}
+	if ime.ghostTelemetry != nil {
+		return
+	}
+	recorder, path, err := ghosttelemetry.NewFileRecorder(rimeLogDir())
+	if err != nil {
+		debugLogf("AI completion telemetry disabled: %v", err)
+		return
+	}
+	ime.ghostTelemetry = recorder
+	debugLogf("AI completion telemetry path=%q", path)
+}
+
 func (ime *IME) configureGhostCompletion(cfg *aiRuntimeConfig) {
 	ime.ghostMu.Lock()
 	defer ime.ghostMu.Unlock()
-	ime.resetGhostCompletionLocked()
+	ime.resetGhostCompletionLockedWithReason("ai_disabled")
 	ime.ghostEnabled = false
 	ime.ghostGenerator = nil
 	if cfg == nil || !cfg.Completion.Enabled || !ime.productSettings.AIEnabled {
@@ -77,7 +140,7 @@ func (ime *IME) handleGhostKeyDownFilter(req *imecore.Request, resp *imecore.Res
 		return false
 	}
 	if req.KeyCode == vkEscape && ime.hasGhostWorkLocked() {
-		ime.resetGhostCompletionLocked()
+		ime.resetGhostCompletionLockedWithReason("dismissed")
 		// Some TSF hosts act on Escape immediately after filterKeyDown. Keep the
 		// complete keystroke inside the IME so the ghost window reliably closes.
 		ime.ghostConsumeKeyUpCode = vkEscape
@@ -106,7 +169,14 @@ func (ime *IME) handleGhostKeyDownFilter(req *imecore.Request, resp *imecore.Res
 	}
 	if shouldInvalidateGhostForKey(req) && ime.hasGhostWorkLocked() {
 		wasVisible := ime.ghostVisible || ime.ghostLoadingVisible
-		ime.resetGhostCompletionLocked()
+		ime.recordGhostInputAdvancedLocked()
+		reason := "new_input"
+		if isGhostCursorMovement(req.KeyCode) {
+			reason = "cursor_moved"
+		}
+		ime.cancelGhostRequestLocked(reason)
+		ime.deferOrCloseGhostOpportunityLocked(reason)
+		ime.clearGhostStateLocked()
 		if wasVisible {
 			ime.ghostHidePending = true
 			resp.HideMessage = true
@@ -156,17 +226,13 @@ func (ime *IME) handleGhostKeyDown(req *imecore.Request, resp *imecore.Response)
 		return true
 	}
 	if req.KeyCode == ghostNextKeyCode && ime.ghostVisible && ime.ghostReady {
-		if len(ime.ghostCandidates) > 1 {
-			ime.ghostCandidateIndex = (ime.ghostCandidateIndex + 1) % len(ime.ghostCandidates)
-		}
+		ime.cycleGhostCandidateLocked()
 		ime.fillGhostResponseLocked(resp)
 		resp.ReturnValue = 1
 		return true
 	}
 	if ime.ghostVisible && isLeftAlt(req) {
-		if len(ime.ghostCandidates) > 1 {
-			ime.ghostCandidateIndex = (ime.ghostCandidateIndex + 1) % len(ime.ghostCandidates)
-		}
+		ime.cycleGhostCandidateLocked()
 		ime.fillGhostResponseLocked(resp)
 		resp.ReturnValue = 1
 		return true
@@ -196,7 +262,7 @@ func (ime *IME) handleGhostPreservedKey(req *imecore.Request, resp *imecore.Resp
 			resp.ReturnValue = 0
 			return true
 		}
-		ime.ghostCandidateIndex = (ime.ghostCandidateIndex + 1) % len(ime.ghostCandidates)
+		ime.cycleGhostCandidateLocked()
 		ime.fillGhostResponseLocked(resp)
 		resp.ReturnValue = 1
 		return true
@@ -275,9 +341,26 @@ func (ime *IME) performGhostActionLocked(resp *imecore.Response) bool {
 		ime.ghostHidePending = false
 	}
 	if ime.ghostVisible && ime.ghostReady {
-		resp.CommitString = ime.currentGhostCandidateLocked()
+		candidate := ime.currentGhostCandidateLocked()
+		candidateID := ime.currentGhostCandidateIDLocked()
+		opportunityID := ime.ghostOpportunityID
+		resp.CommitString = candidate
 		resp.HideMessage = true
-		ime.resetGhostCompletionLocked()
+		if opportunityID != 0 && candidateID != 0 {
+			ime.recordGhostEventLocked(ghosttelemetry.EventAccepted, ghosttelemetry.IDs{
+				OpportunityID: opportunityID,
+				CandidateID:   candidateID,
+			}, ghosttelemetry.AcceptedPayload{AcceptedRunes: len([]rune(candidate)), AcceptActions: 1})
+			ime.closeGhostOpportunityLocked("accepted", 0, 0, 0)
+			ime.ghostPendingCommit = &ghostPendingCommit{opportunityID: opportunityID, candidateID: candidateID}
+			ime.ghostLastAccepted = &ghostAcceptedState{
+				opportunityID:  opportunityID,
+				candidateID:    candidateID,
+				acceptedAt:     time.Now(),
+				remainingRunes: len([]rune(candidate)),
+			}
+		}
+		ime.clearGhostStateLocked()
 		resp.ReturnValue = 1
 		return true
 	}
@@ -320,13 +403,27 @@ func (ime *IME) scheduleGhostCompletion(req *imecore.Request) {
 }
 
 func (ime *IME) scheduleGhostCompletionAfterCommit(req *imecore.Request, resp *imecore.Response, compositionBeforeCommit string) {
-	if req == nil || resp == nil || strings.TrimSpace(resp.CommitString) == "" {
+	if req == nil || resp == nil {
+		return
+	}
+	if resp.CommitString != "" {
+		// The Windows frontend deliberately sends an empty surrounding-text
+		// payload for password/private fields. Treat unavailable context the same
+		// way and collect no commit telemetry from that request.
+		if req.CloudClipboardText != "" {
+			ime.recordGhostTextCommit(resp.CommitString)
+		} else {
+			ime.resetGhostPhysicalKeyActions()
+		}
+	}
+	if strings.TrimSpace(resp.CommitString) == "" {
 		return
 	}
 	documentBefore, following := decodeGhostSurroundingText(req.CloudClipboardText)
 	context := committedGhostContext(documentBefore, compositionBeforeCommit, resp.CommitString)
 	debugLogf("Ghost commit trigger context_runes=%d preedit_runes=%d commit_runes=%d", len([]rune(context)), len([]rune(compositionBeforeCommit)), len([]rune(resp.CommitString)))
-	ime.scheduleGhostCompletionWithContext(req, context, following)
+	ime.scheduleGhostCompletionForSurroundingWithTrigger(context, following, false,
+		time.Duration(ime.ghostConfig.IdleMS)*time.Millisecond, false, "after_commit")
 }
 
 func (ime *IME) scheduleGhostCompletionWithContext(req *imecore.Request, rawContext, rawFollowing string) {
@@ -336,23 +433,28 @@ func (ime *IME) scheduleGhostCompletionWithContext(req *imecore.Request, rawCont
 	if ime.productSettings.AIRunMode == aiRunModeManual {
 		return
 	}
-	ime.scheduleGhostCompletionForSurrounding(rawContext, rawFollowing, false,
-		time.Duration(ime.ghostConfig.IdleMS)*time.Millisecond, false)
+	ime.scheduleGhostCompletionForSurroundingWithTrigger(rawContext, rawFollowing, false,
+		time.Duration(ime.ghostConfig.IdleMS)*time.Millisecond, false, "typing_idle")
 }
 
 func (ime *IME) scheduleGhostCompletionForSurrounding(rawContext, rawFollowing string, revealRequested bool, delay time.Duration, longMode bool) {
+	trigger := "automatic"
+	if revealRequested {
+		trigger = "manual"
+	}
+	ime.scheduleGhostCompletionForSurroundingWithTrigger(rawContext, rawFollowing, revealRequested, delay, longMode, trigger)
+}
+
+func (ime *IME) scheduleGhostCompletionForSurroundingWithTrigger(rawContext, rawFollowing string, revealRequested bool, delay time.Duration, longMode bool, trigger string) {
 	ime.ghostMu.Lock()
 	defer ime.ghostMu.Unlock()
 	if !ime.ghostEnabled || ime.ghostGenerator == nil {
 		return
 	}
+	ime.resolveDeferredGhostOpportunityLocked(rawContext, "new_input")
 	context := normalizeCompletionContext(rawContext, ime.ghostConfig.ContextTokens)
 	following := normalizeFollowingCompletionContext(rawFollowing, 64)
 	if context == "" {
-		return
-	}
-	if hasUnsafeInlineBoundary(context, following) {
-		ime.resetGhostCompletionLocked()
 		return
 	}
 	if context == ime.ghostContext && following == ime.ghostFollowingContext && longMode == ime.ghostLong && ime.hasGhostWorkLocked() {
@@ -362,11 +464,16 @@ func (ime *IME) scheduleGhostCompletionForSurrounding(rawContext, rawFollowing s
 		return
 	}
 	if ime.backend == nil || !ime.backendReady() || ime.backend.State().Composition != "" {
-		ime.resetGhostCompletionLocked()
+		ime.resetGhostCompletionLockedWithReason("new_input")
 		return
 	}
 
-	ime.resetGhostCompletionLocked()
+	ime.resetGhostCompletionLockedWithReason("new_input")
+	ime.openGhostOpportunityLocked(trigger)
+	if hasUnsafeInlineBoundary(context, following) {
+		ime.closeGhostOpportunityLocked("low_confidence", 0, 0, 0)
+		return
+	}
 	ime.ghostContext = context
 	ime.ghostFollowingContext = following
 	ime.ghostLong = longMode
@@ -445,14 +552,59 @@ func (ime *IME) startGhostCompletion(requestSeq uint64, context, following strin
 	generator := ime.ghostGenerator
 	cfg := ime.ghostConfig
 	sender := ime.asyncResponseSender
+	ctx, cancel := contextpkg.WithCancel(contextpkg.Background())
+	request := &ghostRequestState{
+		id:            ime.nextGhostRequestIDLocked(),
+		opportunityID: ime.ghostOpportunityID,
+		cancel:        cancel,
+		started:       time.Now(),
+		telemetry:     ime.ghostTelemetry,
+	}
+	ime.ghostRequest = request
+	ime.recordGhostEventLocked(ghosttelemetry.EventRequestStarted, ghosttelemetry.IDs{
+		OpportunityID: request.opportunityID,
+		RequestID:     request.id,
+	}, ghosttelemetry.RequestStartedPayload{Generator: "llm", RequestedCandidates: cfg.CandidateCount})
 	ime.ghostMu.Unlock()
 
-	started := time.Now()
+	started := request.started
 	debugLogf("Ghost completion started seq=%d context_runes=%d", requestSeq, len([]rune(context)))
-	candidates, err := generator(aiCompletionRequest{Context: context, FollowingContext: following, Long: longMode}, cfg)
+	candidates, err := generator(ctx, aiCompletionRequest{Context: context, FollowingContext: following, Long: longMode}, cfg)
+	cancel()
+	maxRunes := ghostShortMaxRunes
+	if following != "" {
+		maxRunes = 20
+	} else if longMode {
+		maxRunes = ghostLongMaxRunes
+	}
+	normalizedCandidates := normalizeInlineCompletionsWithOptions(context, following, candidates, cfg.CandidateCount, maxRunes)
 
 	var updateResp *imecore.Response
 	ime.ghostMu.Lock()
+	elapsed := time.Since(started)
+	candidateIDs := ime.recordGhostCandidatesReadyLocked(request, normalizedCandidates, elapsed)
+	status := "completed"
+	if errors.Is(err, contextpkg.Canceled) {
+		status = "cancelled"
+	} else if errors.Is(err, contextpkg.DeadlineExceeded) {
+		status = "timeout"
+	} else if err != nil {
+		status = "error"
+	}
+	ime.recordGhostEventWithRecorderLocked(request.telemetry, ghosttelemetry.EventRequestFinished, ghosttelemetry.IDs{
+		OpportunityID: request.opportunityID,
+		RequestID:     request.id,
+	}, ghosttelemetry.RequestFinishedPayload{
+		Status:              status,
+		FinishedAfterCancel: request.cancelRequested && status == "completed",
+		ElapsedMS:           elapsed.Milliseconds(),
+	})
+	if ime.ghostRequest == request {
+		ime.ghostRequest = nil
+	}
+	if request.closeTelemetryOnFinish && request.telemetry != nil {
+		_ = request.telemetry.Close()
+	}
 	if requestSeq == ime.ghostRequestSeq && context == ime.ghostContext && following == ime.ghostFollowingContext && longMode == ime.ghostLong {
 		ime.ghostPending = false
 		if ime.ghostLoadingTimer != nil {
@@ -462,13 +614,8 @@ func (ime *IME) startGhostCompletion(requestSeq uint64, context, following strin
 		loadingWasVisible := ime.ghostLoadingVisible
 		ime.ghostLoadingVisible = false
 		if err == nil {
-			maxRunes := ghostShortMaxRunes
-			if following != "" {
-				maxRunes = 20
-			} else if longMode {
-				maxRunes = ghostLongMaxRunes
-			}
-			ime.ghostCandidates = normalizeInlineCompletionsWithOptions(context, following, candidates, cfg.CandidateCount, maxRunes)
+			ime.ghostCandidates = normalizedCandidates
+			ime.ghostCandidateIDs = candidateIDs
 			ime.ghostCandidateIndex = 0
 			ime.ghostReady = len(ime.ghostCandidates) > 0
 			if ime.ghostReady && ime.ghostRevealRequested {
@@ -481,6 +628,7 @@ func (ime *IME) startGhostCompletion(requestSeq uint64, context, following strin
 			}
 			if !ime.ghostReady {
 				ime.ghostRevealRequested = false
+				ime.closeGhostOpportunityLocked("no_candidate", 0, 0, 0)
 			}
 		} else {
 			if ime.ghostRevealRequested {
@@ -490,11 +638,15 @@ func (ime *IME) startGhostCompletion(requestSeq uint64, context, following strin
 					Duration: 3,
 				}
 			}
-			ime.resetGhostCompletionLocked()
+			reason := "request_error"
+			if status == "timeout" {
+				reason = "request_timeout"
+			}
+			ime.resetGhostCompletionLockedWithReason(reason)
 		}
 	}
 	ime.ghostMu.Unlock()
-	debugLogf("Ghost completion finished seq=%d elapsed=%s candidates=%d err=%v", requestSeq, time.Since(started), len(candidates), err)
+	debugLogf("Ghost completion finished seq=%d elapsed=%s candidates=%d err=%v", requestSeq, elapsed, len(candidates), err)
 	if updateResp != nil && sender != nil {
 		sender(updateResp)
 	}
@@ -541,6 +693,11 @@ func (ime *IME) fillGhostResponseLocked(resp *imecore.Response) {
 		return
 	}
 	if candidate := ime.currentGhostCandidateLocked(); candidate != "" {
+		if !ime.ghostShown {
+			ime.ghostShown = true
+			ime.recordGhostEventLocked(ghosttelemetry.EventShown, ghosttelemetry.IDs{OpportunityID: ime.ghostOpportunityID},
+				ghosttelemetry.ShownPayload{CandidateIDs: append([]uint64(nil), ime.ghostCandidateIDs...)})
+		}
 		resp.ShowMessage = &imecore.MessageWindow{Message: candidate, Duration: ghostMessageDuration}
 	}
 }
@@ -555,6 +712,26 @@ func (ime *IME) currentGhostCandidateLocked() string {
 	return ime.ghostCandidates[ime.ghostCandidateIndex]
 }
 
+func (ime *IME) currentGhostCandidateIDLocked() uint64 {
+	if ime.ghostCandidateIndex < 0 || ime.ghostCandidateIndex >= len(ime.ghostCandidateIDs) {
+		return 0
+	}
+	return ime.ghostCandidateIDs[ime.ghostCandidateIndex]
+}
+
+func (ime *IME) cycleGhostCandidateLocked() {
+	if len(ime.ghostCandidates) < 2 {
+		return
+	}
+	fromID := ime.currentGhostCandidateIDLocked()
+	ime.ghostCandidateIndex = (ime.ghostCandidateIndex + 1) % len(ime.ghostCandidates)
+	toID := ime.currentGhostCandidateIDLocked()
+	if fromID != 0 && toID != 0 {
+		ime.recordGhostEventLocked(ghosttelemetry.EventCycled, ghosttelemetry.IDs{OpportunityID: ime.ghostOpportunityID},
+			ghosttelemetry.CycledPayload{FromCandidateID: fromID, ToCandidateID: toID})
+	}
+}
+
 func (ime *IME) hasGhostWork() bool {
 	ime.ghostMu.Lock()
 	defer ime.ghostMu.Unlock()
@@ -567,12 +744,27 @@ func (ime *IME) hasGhostWorkLocked() bool {
 }
 
 func (ime *IME) resetGhostCompletion() {
+	ime.resetGhostCompletionWithReason("dismissed")
+}
+
+func (ime *IME) resetGhostCompletionWithReason(reason string) {
 	ime.ghostMu.Lock()
 	defer ime.ghostMu.Unlock()
-	ime.resetGhostCompletionLocked()
+	ime.resetGhostCompletionLockedWithReason(reason)
 }
 
 func (ime *IME) resetGhostCompletionLocked() {
+	ime.resetGhostCompletionLockedWithReason("dismissed")
+}
+
+func (ime *IME) resetGhostCompletionLockedWithReason(reason string) {
+	ime.cancelGhostRequestLocked(reason)
+	ime.closeGhostOpportunityLocked(reason, 0, 0, 0)
+	ime.closeDeferredGhostOpportunityLocked(reason, "")
+	ime.clearGhostStateLocked()
+}
+
+func (ime *IME) clearGhostStateLocked() {
 	ime.ghostRequestSeq++
 	if ime.ghostTimer != nil {
 		ime.ghostTimer.Stop()
@@ -588,12 +780,256 @@ func (ime *IME) resetGhostCompletionLocked() {
 	ime.ghostVisible = false
 	ime.ghostRevealRequested = false
 	ime.ghostCandidates = nil
+	ime.ghostCandidateIDs = nil
 	ime.ghostCandidateIndex = 0
+	ime.ghostShown = false
 	ime.ghostConsumeKeyUpCode = 0
 	ime.ghostContext = ""
 	ime.ghostFollowingContext = ""
 	ime.ghostLong = false
 	ime.ghostHidePending = false
+	ime.ghostOpportunityID = 0
+	ime.ghostOpportunityOpen = false
+}
+
+func (ime *IME) recordGhostEventLocked(event string, ids ghosttelemetry.IDs, payload any) {
+	ime.recordGhostEventWithRecorderLocked(ime.ghostTelemetry, event, ids, payload)
+}
+
+func (ime *IME) recordGhostEventWithRecorderLocked(recorder *ghosttelemetry.Recorder, event string, ids ghosttelemetry.IDs, payload any) {
+	if recorder == nil {
+		return
+	}
+	if err := recorder.Record(event, ids, payload); err != nil {
+		debugLogf("AI completion telemetry write failed: %v", err)
+	}
+}
+
+func (ime *IME) nextGhostRequestIDLocked() uint64 {
+	if ime.ghostTelemetry == nil {
+		return 0
+	}
+	return ime.ghostTelemetry.NextRequestID()
+}
+
+func (ime *IME) openGhostOpportunityLocked(trigger string) {
+	if ime.ghostTelemetry == nil {
+		return
+	}
+	ime.ghostOpportunityID = ime.ghostTelemetry.NextOpportunityID()
+	ime.ghostOpportunityOpen = true
+	ime.recordGhostEventLocked(ghosttelemetry.EventOpportunityCreated, ghosttelemetry.IDs{OpportunityID: ime.ghostOpportunityID},
+		ghosttelemetry.OpportunityCreatedPayload{
+			Mode:               string(ime.productSettings.AIRunMode),
+			CompositionVersion: ime.ghostCompositionVersion,
+			Trigger:            trigger,
+		})
+}
+
+func (ime *IME) closeGhostOpportunityLocked(reason string, matchedCandidateID uint64, matchedPrefixRunes, manualRunes int) {
+	if !ime.ghostOpportunityOpen || ime.ghostOpportunityID == 0 {
+		return
+	}
+	ime.recordGhostEventLocked(ghosttelemetry.EventOpportunityClosed, ghosttelemetry.IDs{OpportunityID: ime.ghostOpportunityID},
+		ghosttelemetry.OpportunityClosedPayload{
+			Reason:             reason,
+			MatchedCandidateID: matchedCandidateID,
+			MatchedPrefixRunes: matchedPrefixRunes,
+			ManualRunes:        manualRunes,
+		})
+	ime.ghostOpportunityOpen = false
+}
+
+func (ime *IME) cancelGhostRequestLocked(reason string) {
+	request := ime.ghostRequest
+	if request == nil || request.cancelRequested {
+		return
+	}
+	request.cancelRequested = true
+	ime.recordGhostEventLocked(ghosttelemetry.EventRequestCancelRequested, ghosttelemetry.IDs{
+		OpportunityID: request.opportunityID,
+		RequestID:     request.id,
+	}, ghosttelemetry.RequestCancelRequestedPayload{Reason: reason})
+	request.cancel()
+}
+
+func (ime *IME) recordGhostCandidatesReadyLocked(request *ghostRequestState, candidates []string, elapsed time.Duration) []uint64 {
+	if request.telemetry == nil || len(candidates) == 0 {
+		return nil
+	}
+	features := make([]ghosttelemetry.CandidateFeature, 0, len(candidates))
+	ids := make([]uint64, 0, len(candidates))
+	for index, candidate := range candidates {
+		candidateID := request.telemetry.NextCandidateID()
+		ids = append(ids, candidateID)
+		features = append(features, ghosttelemetry.CandidateFeature{
+			CandidateID:    candidateID,
+			FeatureVersion: ghostFeatureVersion,
+			Rank:           index + 1,
+			Source:         "llm",
+			Runes:          len([]rune(candidate)),
+			NaturalEnd:     completionContextEndsSentence(candidate),
+		})
+	}
+	ime.recordGhostEventWithRecorderLocked(request.telemetry, ghosttelemetry.EventCandidateReady, ghosttelemetry.IDs{
+		OpportunityID: request.opportunityID,
+		RequestID:     request.id,
+	}, ghosttelemetry.CandidateReadyPayload{Candidates: features, GenerationMS: elapsed.Milliseconds()})
+	return ids
+}
+
+func (ime *IME) recordGhostInputAdvancedLocked() {
+	if !ime.ghostOpportunityOpen || ime.ghostOpportunityID == 0 {
+		return
+	}
+	ime.ghostCompositionVersion++
+	ime.recordGhostEventLocked(ghosttelemetry.EventInputAdvanced, ghosttelemetry.IDs{OpportunityID: ime.ghostOpportunityID},
+		ghosttelemetry.InputAdvancedPayload{CompositionVersion: ime.ghostCompositionVersion})
+}
+
+func (ime *IME) deferOrCloseGhostOpportunityLocked(reason string) {
+	if !ime.ghostOpportunityOpen {
+		return
+	}
+	if !ime.ghostShown || len(ime.ghostCandidates) == 0 {
+		ime.closeGhostOpportunityLocked(reason, 0, 0, 0)
+		return
+	}
+	if ime.ghostDeferredClose != nil {
+		ime.closeDeferredGhostOpportunityLocked(ime.ghostDeferredClose.reason, "")
+	}
+	ime.ghostDeferredClose = &ghostDeferredClose{
+		opportunityID: ime.ghostOpportunityID,
+		reason:        reason,
+		context:       ime.ghostContext,
+		candidates:    append([]string(nil), ime.ghostCandidates...),
+		candidateIDs:  append([]uint64(nil), ime.ghostCandidateIDs...),
+	}
+	ime.ghostOpportunityOpen = false
+}
+
+func (ime *IME) resolveDeferredGhostOpportunityLocked(rawContext, reason string) {
+	deferred := ime.ghostDeferredClose
+	if deferred == nil || rawContext == "" || rawContext == deferred.context {
+		return
+	}
+	if strings.HasPrefix(rawContext, deferred.context) {
+		ime.closeDeferredGhostOpportunityLocked(reason, strings.TrimPrefix(rawContext, deferred.context))
+	}
+}
+
+func (ime *IME) closeDeferredGhostOpportunityLocked(reason, manual string) {
+	deferred := ime.ghostDeferredClose
+	if deferred == nil {
+		return
+	}
+	matchedID, matchedRunes := bestGhostPrefixMatch(manual, deferred.candidates, deferred.candidateIDs)
+	if reason == "" {
+		reason = deferred.reason
+	}
+	ime.recordGhostEventLocked(ghosttelemetry.EventOpportunityClosed, ghosttelemetry.IDs{OpportunityID: deferred.opportunityID},
+		ghosttelemetry.OpportunityClosedPayload{
+			Reason:             reason,
+			MatchedCandidateID: matchedID,
+			MatchedPrefixRunes: matchedRunes,
+			ManualRunes:        len([]rune(manual)),
+		})
+	ime.ghostDeferredClose = nil
+}
+
+func bestGhostPrefixMatch(manual string, candidates []string, candidateIDs []uint64) (uint64, int) {
+	manualRunes := []rune(manual)
+	bestIndex, bestRunes := -1, 0
+	for index, candidate := range candidates {
+		candidateRunes := []rune(candidate)
+		matched := 0
+		for matched < len(manualRunes) && matched < len(candidateRunes) && manualRunes[matched] == candidateRunes[matched] {
+			matched++
+		}
+		if matched > bestRunes {
+			bestIndex, bestRunes = index, matched
+		}
+	}
+	if bestIndex < 0 || bestIndex >= len(candidateIDs) {
+		return 0, bestRunes
+	}
+	return candidateIDs[bestIndex], bestRunes
+}
+
+func (ime *IME) recordGhostPhysicalKeyAction(req *imecore.Request) {
+	if req == nil || isModifierKey(req.KeyCode) {
+		return
+	}
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	if ime.ghostTelemetry == nil {
+		return
+	}
+	ime.ghostPhysicalKeyActions++
+	accepted := ime.ghostLastAccepted
+	if accepted == nil {
+		return
+	}
+	elapsed := time.Since(accepted.acceptedAt)
+	if elapsed > ghostQuickUndoWindow || req.KeyCode != vkBack {
+		ime.ghostLastAccepted = nil
+		return
+	}
+	if !accepted.undoRecorded && accepted.remainingRunes > 0 {
+		accepted.undoRecorded = true
+		accepted.remainingRunes--
+		ime.recordGhostEventLocked(ghosttelemetry.EventQuickUndo, ghosttelemetry.IDs{
+			OpportunityID: accepted.opportunityID,
+			CandidateID:   accepted.candidateID,
+		}, ghosttelemetry.QuickUndoPayload{RemovedRunes: 1, ElapsedMS: elapsed.Milliseconds()})
+	}
+}
+
+func (ime *IME) recordGhostTextCommit(text string) {
+	if text == "" {
+		return
+	}
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	if ime.ghostTelemetry == nil {
+		return
+	}
+	if ime.ghostDeferredClose != nil {
+		ime.closeDeferredGhostOpportunityLocked(ime.ghostDeferredClose.reason, text)
+	}
+	ids := ghosttelemetry.IDs{}
+	source := "manual"
+	if pending := ime.ghostPendingCommit; pending != nil {
+		source = "ai"
+		ids.OpportunityID = pending.opportunityID
+		ids.CandidateID = pending.candidateID
+		ime.ghostPendingCommit = nil
+	}
+	ime.recordGhostEventLocked(ghosttelemetry.EventTextCommitted, ids, ghosttelemetry.TextCommittedPayload{
+		Source:                                source,
+		OutputRunes:                           len([]rune(text)),
+		PhysicalKeyActionsSincePreviousCommit: ime.ghostPhysicalKeyActions,
+	})
+	ime.ghostPhysicalKeyActions = 0
+}
+
+func (ime *IME) resetGhostPhysicalKeyActions() {
+	ime.ghostMu.Lock()
+	defer ime.ghostMu.Unlock()
+	ime.ghostPhysicalKeyActions = 0
+}
+
+func isModifierKey(keyCode int) bool {
+	switch keyCode {
+	case vkShift, vkControl, vkMenu, vkLShift, vkRShift, vkLControl, vkRControl, vkLMenu, vkRMenu:
+		return true
+	default:
+		return false
+	}
+}
+
+func isGhostCursorMovement(keyCode int) bool {
+	return isCaretMovementKey(keyCode)
 }
 
 func isLeftAlt(req *imecore.Request) bool {

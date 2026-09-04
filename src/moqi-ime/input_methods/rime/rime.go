@@ -3,6 +3,7 @@
 package rime
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gaboolic/moqi-ime/imecore"
+	"github.com/gaboolic/moqi-ime/internal/ghosttelemetry"
 )
 
 const (
@@ -226,7 +228,8 @@ type IME struct {
 	ghostMu                      sync.Mutex
 	ghostEnabled                 bool
 	ghostConfig                  aiCompletionConfig
-	ghostGenerator               func(aiCompletionRequest, aiCompletionConfig) ([]string, error)
+	ghostGenerator               func(context.Context, aiCompletionRequest, aiCompletionConfig) ([]string, error)
+	ghostTelemetry               *ghosttelemetry.Recorder
 	ghostTimer                   *time.Timer
 	ghostLoadingTimer            *time.Timer
 	ghostLoadingDelay            time.Duration
@@ -243,6 +246,16 @@ type IME struct {
 	ghostFollowingContext        string
 	ghostLong                    bool
 	ghostHidePending             bool
+	ghostOpportunityID           uint64
+	ghostOpportunityOpen         bool
+	ghostRequest                 *ghostRequestState
+	ghostCandidateIDs            []uint64
+	ghostShown                   bool
+	ghostCompositionVersion      uint64
+	ghostPhysicalKeyActions      int
+	ghostDeferredClose           *ghostDeferredClose
+	ghostPendingCommit           *ghostPendingCommit
+	ghostLastAccepted            *ghostAcceptedState
 	appearanceVersion            uint64
 	schemeSetVersion             uint64
 	autoPairRulesVersion         uint64
@@ -323,6 +336,7 @@ func New(client *imecore.Client) imecore.TextService {
 		schemeSetVersion:  currentSchemeSetVersion(),
 		productSettings:   settings,
 	}
+	ime.configureGhostTelemetry(cfg != nil && cfg.Completion.TelemetryEnabled)
 	ime.configureGhostCompletion(cfg)
 	ime.loadAppearancePrefs()
 	// Product visuals are deliberately fixed. Loading the legacy preference
@@ -430,7 +444,7 @@ func (ime *IME) onActivate(req *imecore.Request, resp *imecore.Response) *imecor
 func (ime *IME) onDeactivate(req *imecore.Request, resp *imecore.Response) *imecore.Response {
 	debugLogf("RIME 输入法已失活")
 	ime.activationUIRefreshPending = false
-	ime.resetGhostCompletion()
+	ime.resetGhostCompletionWithReason("session_closed")
 	resp.HideMessage = true
 	resp.RemovePreservedKey = append(resp.RemovePreservedKey,
 		ghostPreservedKeyGUID,
@@ -442,7 +456,11 @@ func (ime *IME) onDeactivate(req *imecore.Request, resp *imecore.Response) *imec
 }
 
 func (ime *IME) onPreservedKey(req *imecore.Request, resp *imecore.Response) *imecore.Response {
+	ime.recordGhostPhysicalKeyAction(req)
 	if ime.handleGhostPreservedKey(req, resp) {
+		if resp.CommitString != "" {
+			ime.recordGhostTextCommit(resp.CommitString)
+		}
 		return resp
 	}
 	resp.ReturnValue = 0
@@ -451,6 +469,7 @@ func (ime *IME) onPreservedKey(req *imecore.Request, resp *imecore.Response) *im
 
 func (ime *IME) filterKeyDown(req *imecore.Request, resp *imecore.Response) *imecore.Response {
 	defer ime.flushPendingActivationUI(req, resp)
+	ime.recordGhostPhysicalKeyAction(req)
 	// Keep a non-destructive copy for post-commit AI completion. Reading
 	// backend.State here or in onKeyDown can consume librime's one-shot commit.
 	ime.ghostPreeditBeforeCommit = ime.rawInputTracked
@@ -643,7 +662,7 @@ func (ime *IME) deleteCandidateOnCurrentPage(req *imecore.Request, resp *imecore
 
 func (ime *IME) onCompositionTerminated(req *imecore.Request, resp *imecore.Response) *imecore.Response {
 	if req.Forced {
-		ime.resetGhostCompletion()
+		ime.resetGhostCompletionWithReason("cursor_moved")
 		resp.HideMessage = true
 	} else if ime.hasGhostWork() {
 		debugLogf("Ghost completion preserved across normal composition termination")
@@ -2198,6 +2217,7 @@ func (ime *IME) reloadAIConfig() error {
 	ime.aiEnabled = false
 	ime.resetAIState()
 	ime.configureGhostCompletion(cfg)
+	ime.configureGhostTelemetry(cfg != nil && cfg.Completion.TelemetryEnabled)
 	debugLogf("本地 AI 配置已重新加载 ghost=%t", ime.ghostEnabled)
 	return nil
 }

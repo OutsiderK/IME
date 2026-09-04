@@ -1,9 +1,9 @@
 # AI 续写接受率改进计划（初稿）
 
-> 状态：研究记录 / 工程提案，尚未进入实现承诺  
-> 版本：0.2  
+> 状态：研究记录 / 初步实现，后续仍可大幅调整
+> 版本：0.3
 > 记录日期：2026-09-04  
-> 最近修订：补齐可确定回放的事件生命周期、指标分母与请求取消观测边界  
+> 最近修订：切片 A/B 已实现，记录代码位置、日志路径与汇总命令
 > 适用范围：`src/moqi-ime/input_methods/rime` 的 AI ghost completion
 
 ## 1. 文档目的
@@ -600,6 +600,42 @@ generator_profile
 - 本文记录的是截至 2026-09-04 的研究判断；实施前应复核模型、llama.cpp 接口和相关新研究。
 
 ## 13. 建议的首次实现切片
+
+### 13.1 实现状态（2026-09-05）
+
+切片 A 和切片 B 已完成首版实现；当前目标是收集可回放基线，尚未开始 Trie/n-gram、ranker、gate、提示词 A/B 或 LoRA 实验。
+
+- 事件类型、JSONL 写入和生命周期校验：`internal/ghosttelemetry/telemetry.go`
+- 确定性指标汇总：`internal/ghosttelemetry/metrics.go`
+- 命令行入口：`cmd/ghost-metrics/main.go`
+- 输入法事件接入、部分匹配和请求取消：`input_methods/rime/ghost_completion.go`
+- HTTP `context.Context` 传递：`input_methods/rime/ai_client.go`
+- 固定回放样本：`internal/ghosttelemetry/testdata/session.jsonl`
+
+开启 AI 续写时，事件默认写入：
+
+```text
+%LOCALAPPDATA%\MoqiIM\Log\ai-completion-events-YYYY-MM-DD.jsonl
+```
+
+文件只保存 ID、时间、字符/按键数和派生特征，不保存上下文、候选文本或最终输入原文。Windows 前端在密码和私密输入域不提供上下文；Go 端对空上下文请求不记录提交事件。
+
+如果需要停止收集，在用户 `ai_config.json` 的 `completion` 下设置 `"telemetry_enabled": false` 并重新加载配置。清理某一天的文件使用精确路径：
+
+```powershell
+go run ./cmd/ghost-metrics -clear -input "$env:LOCALAPPDATA\MoqiIM\Log\ai-completion-events-2026-09-05.jsonl"
+```
+
+离线汇总示例：
+
+```powershell
+cd src/moqi-ime
+go run ./cmd/ghost-metrics -input "$env:LOCALAPPDATA\MoqiIM\Log\ai-completion-events-2026-09-05.jsonl"
+```
+
+基线运行一段时间后，先保存该命令的输出和对应版本，再开始后续候选策略实验。
+
+### 13.2 原始切片定义
 
 首次工作拆成两个可独立验证的小切片，避免把埋点正确性和请求行为变化混在同一次实验中。
 

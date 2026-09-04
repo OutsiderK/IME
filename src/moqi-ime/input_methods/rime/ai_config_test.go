@@ -46,6 +46,18 @@ func TestParseAIConfigJSON(t *testing.T) {
 	}
 }
 
+func TestAICompletionTelemetryDefaultsOnAndCanBeDisabled(t *testing.T) {
+	defaults := normalizeAICompletionConfig(aiCompletionFileSpec{})
+	if !defaults.TelemetryEnabled {
+		t.Fatal("telemetry should default on for baseline collection")
+	}
+	disabled := false
+	cfg := normalizeAICompletionConfig(aiCompletionFileSpec{TelemetryEnabled: &disabled})
+	if cfg.TelemetryEnabled {
+		t.Fatal("explicit telemetry opt-out was ignored")
+	}
+}
+
 func TestParseAIConfigJSONFallsBackToEnvForEmptyAPIFields(t *testing.T) {
 	t.Setenv("MOQI_AI_BASE_URL", "https://env.example.test/v1/")
 	t.Setenv("MOQI_AI_API_KEY", "env-secret")

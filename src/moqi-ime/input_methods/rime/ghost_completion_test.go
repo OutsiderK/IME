@@ -1,12 +1,16 @@
 package rime
 
 import (
+	"bytes"
+	"context"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gaboolic/moqi-ime/imecore"
+	"github.com/gaboolic/moqi-ime/internal/ghosttelemetry"
 )
 
 func TestGhostCompletionRejectsRemoteEndpoint(t *testing.T) {
@@ -118,7 +122,7 @@ func TestGhostCompletionPreservedF8GeneratesFromFreshSurroundingText(t *testing.
 	ime.ghostEnabled = true
 	ime.ghostConfig = aiCompletionConfig{IdleMS: 450, ContextTokens: 128, CandidateCount: 3}
 	generated := make(chan aiCompletionRequest, 1)
-	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+	ime.ghostGenerator = func(_ context.Context, input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
 		generated <- input
 		return []string{"苹果。"}, nil
 	}
@@ -153,7 +157,7 @@ func TestGhostCompletionOrdinaryF8GeneratesFromFreshSurroundingText(t *testing.T
 	ime.ghostEnabled = true
 	ime.ghostConfig = aiCompletionConfig{IdleMS: 450, ContextTokens: 128, CandidateCount: 3}
 	generated := make(chan aiCompletionRequest, 1)
-	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+	ime.ghostGenerator = func(_ context.Context, input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
 		generated <- input
 		return []string{"苹果。"}, nil
 	}
@@ -191,7 +195,7 @@ func TestGhostCompletionFastResultSuppressesDelayedLoadingMessage(t *testing.T) 
 	ime.ghostEnabled = true
 	ime.ghostLoadingDelay = 40 * time.Millisecond
 	ime.ghostConfig = aiCompletionConfig{ContextTokens: 128, CandidateCount: 1}
-	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+	ime.ghostGenerator = func(_ context.Context, input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
 		return []string{"，正好可以开始工作了。"}, nil
 	}
 	updates := make(chan *imecore.Response, 2)
@@ -233,7 +237,7 @@ func TestGhostCompletionShowsLoadingOnlyAfterDelay(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
 	defer close(release)
-	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+	ime.ghostGenerator = func(_ context.Context, input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
 		started <- struct{}{}
 		<-release
 		return []string{"，正好可以开始工作了。"}, nil
@@ -287,7 +291,7 @@ func TestGhostCompletionAcceptPrimesContinuousCompletion(t *testing.T) {
 	ime.ghostCandidates = []string{"苹果"}
 	ime.ghostConfig = aiCompletionConfig{IdleMS: 1, ContextTokens: 128, CandidateCount: 1}
 	generated := make(chan aiCompletionRequest, 1)
-	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+	ime.ghostGenerator = func(_ context.Context, input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
 		generated <- input
 		return []string{"，感觉很甜。"}, nil
 	}
@@ -329,7 +333,7 @@ func TestGhostCompletionShiftF8RequestsLongSentence(t *testing.T) {
 	ime.ghostEnabled = true
 	ime.ghostConfig = aiCompletionConfig{ContextTokens: 128, CandidateCount: 3}
 	generated := make(chan aiCompletionRequest, 1)
-	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+	ime.ghostGenerator = func(_ context.Context, input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
 		generated <- input
 		return []string{"，于是我们决定沿着河边慢慢散步，享受难得的悠闲时光。"}, nil
 	}
@@ -464,7 +468,7 @@ func TestGhostCompletionTimerStartsGeneratorWithoutReadingBackendOffThread(t *te
 	ime.ghostEnabled = true
 	ime.ghostConfig = aiCompletionConfig{IdleMS: 1, CandidateCount: 1}
 	generated := make(chan string, 1)
-	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+	ime.ghostGenerator = func(_ context.Context, input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
 		generated <- input.Context
 		return []string{"今天很好。"}, nil
 	}
@@ -497,7 +501,7 @@ func TestGhostCompletionTimerRunsAfterHandleRequestUnlocks(t *testing.T) {
 	ime.ghostEnabled = true
 	ime.ghostConfig = aiCompletionConfig{IdleMS: 1, CandidateCount: 1}
 	generated := make(chan string, 1)
-	ime.ghostGenerator = func(input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+	ime.ghostGenerator = func(_ context.Context, input aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
 		generated <- input.Context
 		return []string{"今天很好。"}, nil
 	}
@@ -582,6 +586,92 @@ func TestGhostCompletionTypingRejectsSuggestion(t *testing.T) {
 	if !resp.HideMessage || ime.hasGhostWork() {
 		t.Fatalf("expected typing to hide and invalidate ghost, resp=%#v", resp)
 	}
+}
+
+func TestGhostCompletionCancellationIsLoggedAndLateResultCannotUpdateUI(t *testing.T) {
+	output := &lockedBuffer{}
+	ime := newIsolatedTestIME(t)
+	ime.ghostTelemetry = ghosttelemetry.NewRecorder(output, "cancellation-test", nil)
+	ime.ghostEnabled = true
+	ime.ghostConfig = aiCompletionConfig{ContextTokens: 128, CandidateCount: 1}
+	started := make(chan context.Context, 1)
+	release := make(chan struct{})
+	ime.ghostGenerator = func(ctx context.Context, _ aiCompletionRequest, _ aiCompletionConfig) ([]string, error) {
+		started <- ctx
+		<-release
+		return []string{"，这是不应显示的晚到结果。"}, nil
+	}
+	updates := make(chan *imecore.Response, 1)
+	ime.asyncResponseSender = func(resp *imecore.Response) { updates <- resp }
+	t.Cleanup(ime.resetGhostCompletion)
+
+	ime.scheduleGhostCompletionForSurrounding("请求即将被新输入替代", "", true, 0, false)
+	var requestContext context.Context
+	select {
+	case requestContext = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("completion request did not start")
+	}
+	typing := &imecore.Request{KeyCode: 'A', CharCode: 'a', KeyStates: make(imecore.KeyStates, 256)}
+	if ime.handleGhostKeyDownFilter(typing, imecore.NewResponse(1, true)) {
+		t.Fatal("typing should remain on the normal input path")
+	}
+	select {
+	case <-requestContext.Done():
+	case <-time.After(time.Second):
+		t.Fatal("superseded request context was not cancelled")
+	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(output.String(), `"event":"request_finished"`) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case update := <-updates:
+		t.Fatalf("late response updated ghost UI: %#v", update)
+	default:
+	}
+	events, err := ghosttelemetry.Decode(strings.NewReader(output.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ghosttelemetry.ValidateComplete(events); err != nil {
+		t.Fatalf("cancellation lifecycle did not close: %v\n%s", err, output.String())
+	}
+	if strings.Contains(output.String(), "请求即将被新输入替代") || strings.Contains(output.String(), "这是不应显示的晚到结果") {
+		t.Fatalf("telemetry leaked raw completion text: %s", output.String())
+	}
+	var sawCancel, sawFinishedAfterCancel bool
+	for _, event := range events {
+		switch event.Event {
+		case ghosttelemetry.EventRequestCancelRequested:
+			sawCancel = true
+		case ghosttelemetry.EventRequestFinished:
+			if strings.Contains(string(event.Payload), `"status":"completed"`) && strings.Contains(string(event.Payload), `"finished_after_cancel":true`) {
+				sawFinishedAfterCancel = true
+			}
+		}
+	}
+	if !sawCancel || !sawFinishedAfterCancel {
+		t.Fatalf("missing cancellation lifecycle: %s", output.String())
+	}
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
 
 func TestNormalizeCompletionContextKeepsSixRecentSentencesAndBudget(t *testing.T) {

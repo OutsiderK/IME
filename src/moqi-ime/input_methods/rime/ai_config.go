@@ -45,21 +45,23 @@ type aiActionFileSpec struct {
 }
 
 type aiCompletionFileSpec struct {
-	Enabled         bool    `json:"enabled"`
-	IdleMS          int     `json:"idle_ms"`
-	ContextTokens   int     `json:"context_tokens"`
-	MaxOutputTokens int     `json:"max_output_tokens"`
-	CandidateCount  int     `json:"candidate_count"`
-	Temperature     float64 `json:"temperature"`
+	Enabled          bool    `json:"enabled"`
+	TelemetryEnabled *bool   `json:"telemetry_enabled"`
+	IdleMS           int     `json:"idle_ms"`
+	ContextTokens    int     `json:"context_tokens"`
+	MaxOutputTokens  int     `json:"max_output_tokens"`
+	CandidateCount   int     `json:"candidate_count"`
+	Temperature      float64 `json:"temperature"`
 }
 
 type aiCompletionConfig struct {
-	Enabled         bool
-	IdleMS          int
-	ContextTokens   int
-	MaxOutputTokens int
-	CandidateCount  int
-	Temperature     float64
+	Enabled          bool
+	TelemetryEnabled bool
+	IdleMS           int
+	ContextTokens    int
+	MaxOutputTokens  int
+	CandidateCount   int
+	Temperature      float64
 }
 
 type aiRuntimeConfig struct {
@@ -249,18 +251,22 @@ func parseAIConfigJSON(data []byte) (*aiRuntimeConfig, error) {
 
 func defaultAICompletionConfig() aiCompletionConfig {
 	return aiCompletionConfig{
-		Enabled:         false,
-		IdleMS:          450,
-		ContextTokens:   320,
-		MaxOutputTokens: 32,
-		CandidateCount:  3,
-		Temperature:     0.35,
+		Enabled:          false,
+		TelemetryEnabled: true,
+		IdleMS:           450,
+		ContextTokens:    320,
+		MaxOutputTokens:  32,
+		CandidateCount:   3,
+		Temperature:      0.35,
 	}
 }
 
 func normalizeAICompletionConfig(raw aiCompletionFileSpec) aiCompletionConfig {
 	cfg := defaultAICompletionConfig()
 	cfg.Enabled = raw.Enabled
+	if raw.TelemetryEnabled != nil {
+		cfg.TelemetryEnabled = *raw.TelemetryEnabled
+	}
 	if raw.IdleMS != 0 {
 		cfg.IdleMS = raw.IdleMS
 	}

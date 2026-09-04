@@ -1,7 +1,9 @@
 package rime
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -227,6 +229,44 @@ func TestGenerateInlineCompletionsUsesFewShotAndLocalRepeatControls(t *testing.T
 	lastMessage := captured.Messages[len(captured.Messages)-1]
 	if !strings.Contains(lastMessage.Content, "具体有番茄、") {
 		t.Fatalf("expected actual context in final user turn, got %q", lastMessage.Content)
+	}
+}
+
+func TestGenerateInlineCompletionsContextCancelsHTTPRequest(t *testing.T) {
+	started := make(chan struct{})
+	releaseServer := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-releaseServer:
+		}
+	}))
+	defer func() {
+		close(releaseServer)
+		server.Close()
+	}()
+	client := &aiClient{baseURL: server.URL, apiKey: "local", model: "qwen", httpClient: server.Client()}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.GenerateInlineCompletionsContext(ctx, aiCompletionRequest{Context: "测试取消"},
+			aiCompletionConfig{ContextTokens: 128, CandidateCount: 1, MaxOutputTokens: 32, Temperature: 0.2})
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP request did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context cancellation, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client did not return after cancellation")
 	}
 }
 
