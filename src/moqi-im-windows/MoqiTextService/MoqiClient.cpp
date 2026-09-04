@@ -38,6 +38,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <inputscope.h>
 #include <exception>
@@ -46,6 +47,11 @@
 using namespace std;
 
 namespace Moqi {
+
+struct AsyncCallbackState {
+  std::recursive_mutex mutex;
+  Client *client = nullptr;
+};
 
 static constexpr UINT ASYNC_RPC_POLL_INTERVAL_MS = 50;
 static constexpr int FIRST_PRINTABLE_KEY_RPC_WAIT_MS = 200;
@@ -73,6 +79,31 @@ static constexpr ULONGLONG LAUNCHER_START_RETRY_COOLDOWN_MS = 3000;
 static constexpr ULONGLONG LAUNCHER_KILL_RETRY_COOLDOWN_MS = 15000;
 
 namespace {
+
+std::atomic<UINT_PTR> nextAsyncTimerId{0x4d4f5100};
+std::mutex asyncTimerRegistryMutex;
+std::unordered_map<UINT_PTR, std::weak_ptr<AsyncCallbackState>>
+    asyncTimerRegistry;
+
+void registerAsyncTimer(UINT_PTR id,
+                        const std::shared_ptr<AsyncCallbackState> &state) {
+  std::lock_guard<std::mutex> lock(asyncTimerRegistryMutex);
+  asyncTimerRegistry[id] = state;
+}
+
+void unregisterAsyncTimer(UINT_PTR id) {
+  std::lock_guard<std::mutex> lock(asyncTimerRegistryMutex);
+  asyncTimerRegistry.erase(id);
+}
+
+std::shared_ptr<AsyncCallbackState> findAsyncTimer(UINT_PTR id) {
+  std::lock_guard<std::mutex> lock(asyncTimerRegistryMutex);
+  const auto it = asyncTimerRegistry.find(id);
+  if (it == asyncTimerRegistry.end()) {
+    return {};
+  }
+  return it->second.lock();
+}
 
 constexpr GUID kGuidPropInputScope = {
     0x1713dd5a,
@@ -552,13 +583,17 @@ Client::Client(TextService *service, REFIID langProfileGuid)
       lastLauncherStartAttemptTick_{0}, lastLauncherKillTick_{0},
       asyncPollTimerWindow_(nullptr),
       asyncPollTimerId_(0), asyncFlushInProgress_(false),
-      autoPairRules_(defaultAutoPairRules()) {}
+      asyncApplyInProgress_(false),
+      asyncCallbackState_(std::make_shared<AsyncCallbackState>()),
+      autoPairRules_(defaultAutoPairRules()) {
+  asyncCallbackState_->client = this;
+}
 
 Client::~Client(void) {
-  if (asyncPollTimerId_ != 0) {
-    ::KillTimer(asyncPollTimerWindow_, asyncPollTimerId_);
-    asyncPollTimerId_ = 0;
-    asyncPollTimerWindow_ = nullptr;
+  stopAsyncPollTimer();
+  if (asyncCallbackState_) {
+    std::lock_guard<std::recursive_mutex> lock(asyncCallbackState_->mutex);
+    asyncCallbackState_->client = nullptr;
   }
   closeRpcConnection();
   resetTextServiceState();
@@ -1556,10 +1591,24 @@ moqi::protocol::ClientRequest Client::createRpcRequest(const char *methodName) {
 }
 
 void CALLBACK Client::onAsyncPollTimer(HWND, UINT, UINT_PTR id, DWORD) {
-  auto *client = reinterpret_cast<Client *>(id);
-  if (client != nullptr) {
-    client->pollAsyncResponses();
+  const auto state = findAsyncTimer(id);
+  if (!state) {
+    return;
   }
+  std::lock_guard<std::recursive_mutex> lock(state->mutex);
+  if (state->client != nullptr) {
+    state->client->pollAsyncResponses();
+  }
+}
+
+void Client::stopAsyncPollTimer() {
+  if (asyncPollTimerId_ == 0) {
+    return;
+  }
+  ::KillTimer(asyncPollTimerWindow_, asyncPollTimerId_);
+  unregisterAsyncTimer(asyncPollTimerId_);
+  asyncPollTimerId_ = 0;
+  asyncPollTimerWindow_ = nullptr;
 }
 
 void Client::refreshAsyncPollTimer() {
@@ -1571,16 +1620,21 @@ void Client::refreshAsyncPollTimer() {
 
   if (asyncPollTimerId_ != 0 &&
       (targetWindow == nullptr || targetWindow != asyncPollTimerWindow_)) {
-    ::KillTimer(asyncPollTimerWindow_, asyncPollTimerId_);
-    asyncPollTimerId_ = 0;
-    asyncPollTimerWindow_ = nullptr;
+    stopAsyncPollTimer();
   }
 
   if (targetWindow != nullptr && asyncPollTimerId_ == 0) {
-    asyncPollTimerId_ =
-        ::SetTimer(targetWindow, reinterpret_cast<UINT_PTR>(this),
-                   ASYNC_RPC_POLL_INTERVAL_MS, &Client::onAsyncPollTimer);
+    UINT_PTR requestedId = nextAsyncTimerId.fetch_add(1);
+    if (requestedId == 0) {
+      requestedId = nextAsyncTimerId.fetch_add(1);
+    }
+    asyncPollTimerId_ = ::SetTimer(targetWindow, requestedId,
+                                   ASYNC_RPC_POLL_INTERVAL_MS,
+                                   &Client::onAsyncPollTimer);
     asyncPollTimerWindow_ = asyncPollTimerId_ != 0 ? targetWindow : nullptr;
+    if (asyncPollTimerId_ != 0) {
+      registerAsyncTimer(asyncPollTimerId_, asyncCallbackState_);
+    }
   }
 }
 
@@ -1629,12 +1683,25 @@ bool Client::applyAsyncResponse(Json::Value &msg, Ime::EditSession *session) {
 }
 
 void Client::flushPendingAsyncResponses(Ime::EditSession *session) {
+  if (asyncApplyInProgress_) {
+    return;
+  }
+  asyncApplyInProgress_ = true;
+  struct ApplyGuard {
+    bool &flag;
+    ~ApplyGuard() { flag = false; }
+  } guard{asyncApplyInProgress_};
+
   while (!pendingAsyncResponses_.empty()) {
-    Json::Value msg = pendingAsyncResponses_.front();
+    // Remove the item before applying it. Updating a TSF window can dispatch
+    // nested messages, and an inner RPC/paint callback must never pop the same
+    // deque element while JsonCpp is still using it.
+    Json::Value msg = std::move(pendingAsyncResponses_.front());
+    pendingAsyncResponses_.pop_front();
     if (!applyAsyncResponse(msg, session)) {
+      pendingAsyncResponses_.push_front(std::move(msg));
       break;
     }
-    pendingAsyncResponses_.pop_front();
   }
 }
 
@@ -1655,19 +1722,25 @@ void Client::flushPendingAsyncResponsesWithCurrentContext() {
 
   HRESULT sessionResult = E_FAIL;
   asyncFlushInProgress_ = true;
+  const auto callbackState = asyncCallbackState_;
   auto editSession = Ime::ComPtr<Ime::EditSession>::make(
       context,
-      [this](Ime::EditSession *session, TfEditCookie) {
-        flushPendingAsyncResponses(session);
-        asyncFlushInProgress_ = false;
+      [callbackState](Ime::EditSession *session, TfEditCookie) {
+        std::lock_guard<std::recursive_mutex> lock(callbackState->mutex);
+        if (callbackState->client != nullptr) {
+          callbackState->client->flushPendingAsyncResponses(session);
+          callbackState->client->asyncFlushInProgress_ = false;
+        }
       });
-  context->RequestEditSession(textService_->clientId(), editSession,
-                              TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
-                              &sessionResult);
-  if (FAILED(sessionResult)) {
+  const HRESULT requestResult = context->RequestEditSession(
+      textService_->clientId(), editSession,
+      TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &sessionResult);
+  if (FAILED(requestResult) || FAILED(sessionResult)) {
     asyncFlushInProgress_ = false;
     appendRpcGuardLog(L"async response RequestEditSession failed hr=" +
-                      std::to_wstring(static_cast<long>(sessionResult)));
+                      std::to_wstring(static_cast<long>(FAILED(requestResult)
+                                                           ? requestResult
+                                                           : sessionResult)));
   }
 }
 
@@ -1848,8 +1921,6 @@ bool Client::callRpcMethod(moqi::protocol::ClientRequest &request,
     } else {
       success = false;
     }
-
-    flushPendingAsyncResponses();
 
     if (!success) {
       // A pure timeout on an already-initialized connection usually means the
@@ -2147,11 +2218,7 @@ void Client::resetTextServiceState() {
 void Client::closeRpcConnection() {
   pendingAsyncResponses_.clear();
   handshakeComplete_ = false;
-  if (asyncPollTimerId_ != 0) {
-    ::KillTimer(asyncPollTimerWindow_, asyncPollTimerId_);
-    asyncPollTimerId_ = 0;
-    asyncPollTimerWindow_ = nullptr;
-  }
+  stopAsyncPollTimer();
   if (pipe_ != INVALID_HANDLE_VALUE) {
     DisconnectNamedPipe(pipe_);
     CloseHandle(pipe_);

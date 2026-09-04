@@ -109,8 +109,14 @@ func localAIHealthy(baseURL string) bool {
 
 func startLocalAIServer(baseURL string) (int, error) {
 	modelPath := localAIModelPath()
-	if info, err := os.Stat(modelPath); err != nil || info.IsDir() {
-		return 0, fmt.Errorf("Model file was not found: %s", modelPath)
+	if info, err := os.Stat(modelPath); err != nil {
+		// Do not reject the launch solely on a preflight Stat failure. A long-
+		// lived desktop process can temporarily observe a stale/denied file view
+		// while a fresh child process can open the same model. llama-server is the
+		// authoritative check and reports a real load failure immediately.
+		debugLogf("Local AI model preflight failed path=%q error=%v; trying llama-server", modelPath, err)
+	} else if info.IsDir() {
+		return 0, fmt.Errorf("Model path is a directory: %s", modelPath)
 	}
 	serverPath := localAIServerPath()
 	if serverPath == "" {

@@ -1182,7 +1182,11 @@ bool TextService::moveMessageWindowToInputRect(Ime::EditSession* session) {
 
 void TextService::hideMessage() {
 	if(messageTimerId_) {
-		::KillTimer(messageWindow_->hwnd(), messageTimerId_);
+		// The owner can be destroyed before a queued timer callback runs. Keep
+		// cleanup safe even when the window has already gone away.
+		if (messageWindow_) {
+			::KillTimer(messageWindow_->hwnd(), messageTimerId_);
+		}
 		messageTimerId_ = 0;
 	}
 	if(messageWindow_) {

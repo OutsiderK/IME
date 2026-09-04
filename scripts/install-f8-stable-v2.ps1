@@ -3,16 +3,17 @@
 
 [CmdletBinding()]
 param(
-    [string] $StatusPath = (Join-Path $env:TEMP 'moqi-ghost-ui-v1-status.json')
+    [string] $StatusPath = (Join-Path $env:TEMP 'moqi-f8-stable-v2-status.json')
 )
 
 $ErrorActionPreference = 'Stop'
-$version = 'ghost-ui-v1'
+$version = 'f8-stable-v2'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $installRoot = Join-Path ${env:ProgramFiles(x86)} 'MoqiIM'
-$backendSource = Join-Path $repoRoot 'build\artifacts\backend\server-ghost-ui-v1.exe'
-$frontend64Source = Join-Path $repoRoot 'build\artifacts\ghost-ui-v1\x64\MoqiTextService.dll'
-$frontend32Source = Join-Path $repoRoot 'build\artifacts\ghost-ui-v1\win32\MoqiTextService.dll'
+$backendSource = Join-Path $repoRoot 'build\artifacts\backend\server-f8-stable-v2.exe'
+$frontend64Source = Join-Path $repoRoot 'build\artifacts\f8-stable-v2\x64\MoqiTextService.dll'
+$frontend32Source = Join-Path $repoRoot 'build\artifacts\f8-stable-v2\win32\MoqiTextService.dll'
+$aiStartupSource = Join-Path $repoRoot 'local-ai\ensure-local-ai.ps1'
 $backendTarget = Join-Path $installRoot 'moqi-ime\server.exe'
 $frontend64Target = Join-Path $env:WINDIR "System32\MoqiTextService.$version.dll"
 $frontend32Target = Join-Path $env:WINDIR "SysWOW64\MoqiTextService.$version.dll"
@@ -22,9 +23,10 @@ $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $clsidKey = 'HKCU\Software\Classes\CLSID\{8F204C91-2D7A-4B3E-9E1F-6A5C0D8B2E7F}'
 
 $expectedHashes = @{
-    $backendSource = '230E353C4DE778368DE919E787A9C051647032BF414CC599BAA4C4273CABBCCD'
-    $frontend64Source = '77096303480C6BCBFFBF9F59AB893F716695B9F86E60A4FB3C179EE6970D8A6A'
-    $frontend32Source = 'E1FA14ADD339133F002A66DA56A71B2F4659A0D5EDD1A240E58669DBC14F40ED'
+    $backendSource = 'E6BABC99C03221CB3D3DDBCD48E8B46E2FF5831EC0E1286FF6A1617E6302C09E'
+    $frontend64Source = '014038259FE75ABC8AB45B374B33D8025912F539E614A3C2EAA6D68F1E1B1C3E'
+    $frontend32Source = 'B6309B09F92B6A915B3662476F1C742D30AEC26C0451876A4C80063ADBF12128'
+    $aiStartupSource = '495A4C138F74C3080917F93A55E6271CB1EE994221BAC24F51F15472ECCDD358'
 }
 
 function Assert-Artifact {
@@ -83,6 +85,7 @@ try {
     Assert-Artifact -Path $backendSource
     Assert-Artifact -Path $frontend64Source
     Assert-Artifact -Path $frontend32Source
+    Assert-Artifact -Path $aiStartupSource
 
     Stop-InstalledMoqiRuntime
     Start-Sleep -Milliseconds 500
@@ -90,6 +93,7 @@ try {
     Install-Artifact -Source $backendSource -Destination $backendTarget
     Install-Artifact -Source $frontend64Source -Destination $frontend64Target
     Install-Artifact -Source $frontend32Source -Destination $frontend32Target
+    Install-Artifact -Source $aiStartupSource -Destination $aiStartupScript
 
     $regExe = Join-Path $env:WINDIR 'System32\reg.exe'
     foreach ($registryView in @('/reg:64', '/reg:32')) {
